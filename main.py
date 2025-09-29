@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 # ---------------------------
 # CONFIG: hard-code number of levels
-LEVELS = 1        # change this to 1,2,3...
+LEVELS = 2        # change this to 1,2,3...
 WAVELET = "db4"   # change to 'db1','db4','sym4', etc.
 OUTPUT_FILE = f"dwt_levels{LEVELS}_{WAVELET}.png"
 # ---------------------------
