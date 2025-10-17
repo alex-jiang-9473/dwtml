@@ -17,8 +17,8 @@ WAVELET = "db4"   # Wavelet type: 'db1','db4','sym4', etc.
 LOG_DIR = "results/dwt"
 NUM_LAYERS = 20   # Number of layers in SIREN
 LAYER_SIZE = 56   # Hidden layer size
-ITERATIONS = 5000 # Training iterations
-OUTPUT_FILE = f"dwt_siren_levels{LEVELS}_{WAVELET}_{NUM_LAYERS}_{LAYER_SIZE}_{ITERATIONS}.png"
+ITERATIONS = 2000 # Training iterations
+OUTPUT_FILE = f"dwt_siren_LL_only_levels{LEVELS}_{WAVELET}_{NUM_LAYERS}_{LAYER_SIZE}_{ITERATIONS}.png"
 
 # ---------------------------
 
@@ -30,13 +30,22 @@ def main():
     # 2) Perform multi-level 2D DWT
     coeffs = pywt.wavedec2(A, wavelet=WAVELET, level=LEVELS)
 
-    # 3) Convert coefficients to array and normalize
-    arr, slices = pywt.coeffs_to_array(coeffs)
-
-    # Normalize coefficients for training stability
-    arr_mean = arr.mean()
-    arr_std = arr.std()
-    arr_norm = (arr - arr_mean) / (arr_std + 1e-8)
+    # 3) Extract only the LL (approximation) coefficients
+    # coeffs format: [cA_n, (cH_n, cV_n, cD_n), (cH_n-1, cV_n-1, cD_n-1), ...]
+    # We only want cA_n (the first element - LL part)
+    ll_coeffs = coeffs[0]  # This is the top-left corner (approximation)
+    
+    print(f"Original image shape: {A.shape}")
+    print(f"LL coefficients shape: {ll_coeffs.shape}")
+    
+    # Normalize LL coefficients for training stability
+    arr_mean = ll_coeffs.mean()
+    arr_std = ll_coeffs.std()
+    arr_norm = (ll_coeffs - arr_mean) / (arr_std + 1e-8)
+    
+    # Store the original coeffs and slices for reconstruction
+    # We'll create a modified version with zeros for high-frequency parts
+    arr_full, slices = pywt.coeffs_to_array(coeffs)
 
     # Setup CUDA and data types
     dtype = torch.float32
@@ -58,7 +67,7 @@ def main():
     # Create output directory
     os.makedirs(LOG_DIR, exist_ok=True)
     
-    # Convert normalized coefficients to tensor
+    # Convert normalized LL coefficients to tensor
     coeffs_tensor = transforms.ToTensor()(arr_norm).float().to(device, dtype)
 
     # Initialize SIREN model
@@ -110,21 +119,34 @@ def main():
         # Reconstruct coefficients from network
         coeffs_recon = func_rep(coordinates).reshape(coeffs_tensor.shape[1], coeffs_tensor.shape[2]).float()
         
-        # Denormalize reconstructed coefficients
+        # Denormalize reconstructed LL coefficients
         coeffs_recon_denorm = coeffs_recon * (arr_std + 1e-8) + arr_mean
         
-        # Calculate PSNR on coefficients
-        original_coeffs = torch.tensor(arr).to(device, dtype)
-        hp_psnr = util.get_clamped_psnr(original_coeffs, coeffs_recon_denorm)
+        # Calculate PSNR on LL coefficients
+        original_ll_coeffs = torch.tensor(ll_coeffs).to(device, dtype)
+        hp_psnr = util.get_clamped_psnr(original_ll_coeffs, coeffs_recon_denorm)
         
         # Save metrics
         results_file = os.path.join(LOG_DIR, 'metrics.json')
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=4)
         
-        # Convert reconstructed coefficients for inverse DWT
-        coeffs_np = coeffs_recon_denorm.cpu().numpy()
-        coeffs_recon_list = pywt.array_to_coeffs(coeffs_np, slices, output_format='wavedec2')
+        # Convert reconstructed LL coefficients to numpy
+        ll_recon_np = coeffs_recon_denorm.cpu().numpy()
+        
+        # Create a modified coefficient structure with only LL, rest are zeros
+        # Replace the LL part with our reconstructed coefficients
+        coeffs_modified = [ll_recon_np]  # Start with reconstructed LL
+        
+        # Add zero coefficients for all high-frequency bands
+        for i in range(1, len(coeffs)):
+            # Each detail level has (cH, cV, cD) - set them all to zero
+            cH = np.zeros_like(coeffs[i][0])
+            cV = np.zeros_like(coeffs[i][1])
+            cD = np.zeros_like(coeffs[i][2])
+            coeffs_modified.append((cH, cV, cD))
+        
+        coeffs_recon_list = coeffs_modified
         
         # Perform inverse DWT
         img_recon = pywt.waverec2(coeffs_recon_list, wavelet=WAVELET)
