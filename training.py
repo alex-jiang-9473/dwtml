@@ -35,7 +35,7 @@ class Trainer():
             features (torch.Tensor): Tensor of features. Shape (num_points, feature_dim).
             num_iters (int): Number of iterations to train for.
         """
-        with tqdm.trange(num_iters, ncols=100) as t:
+        with tqdm.trange(num_iters, ncols=100, dynamic_ncols=True) as t:
             for i in t:
                 # Update model
                 self.optimizer.zero_grad()

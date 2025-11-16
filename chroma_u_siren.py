@@ -12,17 +12,19 @@ import util
 # ---------------------------
 # CONFIG
 IMAGEID = "kodim02"
-LOG_DIR = "results/grayscale"
+LOG_DIR = "results/chroma_u"
 NUM_LAYERS = 15
 LAYER_SIZE = 110
 ITERATIONS = 1000
-OUTPUT_FILE = f"siren_{IMAGEID}_L{NUM_LAYERS}_N{LAYER_SIZE}_I{ITERATIONS}.png"
-
+OUTPUT_FILE = f"siren_u_{IMAGEID}_L{NUM_LAYERS}_N{LAYER_SIZE}_I{ITERATIONS}.png"
 # ---------------------------
 
-# 1) Load an image (grayscale for simplicity)
-img = Image.open(f"kodak-dataset/{IMAGEID}.png").convert("L")
-A = np.asarray(img, dtype=np.float32)
+# 1) Load an image and extract U channel from YUV
+img = Image.open(f"kodak-dataset/{IMAGEID}.png").convert("YCbCr")
+y, u, v = img.split()
+
+# Convert U channel to numpy array
+A = np.asarray(u, dtype=np.float32)
 
 # Normalize image to [0,1] range for better training stability
 A = A / 255.0
@@ -78,7 +80,7 @@ results['fp_bpp'].append(fp_bpp)
 results['fp_psnr'].append(trainer.best_vals['psnr'])
 
 # Save best model
-torch.save(trainer.best_model, LOG_DIR + f'/best_model_grayscale.pt')
+torch.save(trainer.best_model, LOG_DIR + f'/best_model_chroma_u.pt')
 
 # Update current model to be best model
 func_rep.load_state_dict(trainer.best_model)
@@ -109,13 +111,14 @@ with torch.no_grad():
     out_img = Image.fromarray(vis_arr)
     out_img.save(OUTPUT_FILE)
     
-    # Calculate PSNR between original and reconstructed images
-    original_img = np.asarray(Image.open(f"kodak-dataset/{IMAGEID}.png").convert("L"))
-    img_psnr = util.calc_psnr(original_img, vis_arr)
-    print(f'Image-space PSNR: {img_psnr:.2f}')
+    # Calculate PSNR between original and reconstructed U channel
+    original_img_yuv = Image.open(f"kodak-dataset/{IMAGEID}.png").convert("YCbCr")
+    original_u = np.asarray(original_img_yuv.split()[1])
+    img_psnr = util.calc_psnr(original_u, vis_arr)
+    print(f'Image-space PSNR (U channel): {img_psnr:.2f}')
     
     print(f'Half precision psnr: {hp_psnr:.2f}')
     results['hp_psnr'].append(hp_psnr)
     results['hp_calc_psnr'].append(float(img_psnr))
 
-print("Grayscale Results:", results)
+print("Chroma U Results:", results)

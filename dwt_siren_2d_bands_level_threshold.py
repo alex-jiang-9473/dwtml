@@ -22,20 +22,24 @@ LOG_DIR = "results/dwt_2d_bands"
 # HF models auto-scale per band based on coeffs: 3-20 layers, 32-128 units, 1000-2000 iters
 MODEL_NUM_LAYERS = 40   # Max layers for very large inputs (LL>=5000px or HF>30k coeffs)
 MODEL_LAYER_SIZE = 128  # Max hidden units for large inputs. Auto-scales down for smaller inputs
-MODEL_ITERATIONS = 1500 # Max training iterations. Auto-scales up for small/complex inputs
+MODEL_ITERATIONS = 2000 # Max training iterations. Auto-scales up for small/complex inputs
 
 # Model width scaling (hidden units). Since params ~ width^2:
-MODEL_SIZE_SCALE_LL = 0.8  # LL model scale: 0.8 → ~64% params (larger for quality)
-MODEL_SIZE_SCALE_HF = 0.25  # HF model scale: 0.25 → ~6% params (smaller for compression)
+MODEL_SIZE_SCALE_LL = 0.6  # LL model scale: 0.6 → ~36% params (smaller for compression)
+MODEL_SIZE_SCALE_HF = 0.5  # HF model scale: 0.5 → ~25% params (smaller for compression)
 
 # High-frequency coefficient handling mode
 USE_SPARSE_HF = True  # True: Use sparse threshold training for HF, False: Fill HF with zeros
-THRESHOLD_FACTOR = 2  # Only used when USE_SPARSE_HF=True. Keep coefficients above this * std
+THRESHOLD_FACTOR = 1  # Only used when USE_SPARSE_HF=True. Keep coefficients above this * std
 # Range: 0.01 - 2.00 for sparse, 100+ to zero out all HF (black). Lower values keep more coefficients
 
-IMAGEID = "kodim01"
+# Per-level threshold scaling: effective_threshold(level) = base_threshold * (LEVEL_THRESHOLD_GAMMA ** (level_idx-1))
+# level_idx starts from 1 for the finest level (highest resolution details). Set <1 to keep more at coarser levels.
+LEVEL_THRESHOLD_GAMMA = 0.8
 
-OUTPUT_FILE = f"{IMAGEID}_dwt_2d_bands_levels{LEVELS}_{WAVELET}_thresh{THRESHOLD_FACTOR}.png"
+IMAGEID = "kodim02"
+
+OUTPUT_FILE = f"{IMAGEID}_dwt_2d_bands_levels{LEVELS}_{WAVELET}_thresh{THRESHOLD_FACTOR}_gamma{LEVEL_THRESHOLD_GAMMA}.png"
 
 # ---------------------------
 
@@ -88,51 +92,56 @@ def main():
     band_data_per_level = []
     
     if USE_SPARSE_HF:
-        # Collect all HF coefficients to compute threshold
+        # Collect all HF coefficients to compute threshold (global stats)
         all_hf_coeffs = []
         for level_idx in range(1, len(coeffs)):
             cH, cV, cD = coeffs[level_idx]
             all_hf_coeffs.extend(cH.flatten())
             all_hf_coeffs.extend(cV.flatten())
             all_hf_coeffs.extend(cD.flatten())
-        
         all_hf_coeffs = np.array(all_hf_coeffs)
+
         hf_std = np.std(all_hf_coeffs)
-        threshold = THRESHOLD_FACTOR * hf_std
-        
+        base_threshold = THRESHOLD_FACTOR * hf_std
+
         print(f"\nHigh-frequency std: {hf_std:.2f}")
-        print(f"Threshold for sparsity: {threshold:.2f}")
-        
+        print(f"Base threshold (level 1 before gamma scaling): {base_threshold:.2f}")
+        print(f"Per-level gamma: {LEVEL_THRESHOLD_GAMMA}")
+
         total_coeffs = 0
         total_significant = 0
-        
+
         # Extract sparse 2D coordinates for each band at each level
         for level_idx in range(1, len(coeffs)):
             cH, cV, cD = coeffs[level_idx]
-            
-            print(f"\nLevel {level_idx}:")
+
+            # Compute per-level threshold (coeffs[1] is finest; higher indices are coarser)
+            level_threshold = base_threshold * (LEVEL_THRESHOLD_GAMMA ** (level_idx - 1))
+
+            print(f"\nLevel {level_idx}: (threshold={level_threshold:.2f})")
             print(f"  cH shape: {cH.shape}, cV shape: {cV.shape}, cD shape: {cD.shape}")
-            
-            # Extract sparse data for each band (only significant coefficients)
-            cH_vals, cH_coords, cH_rows, cH_cols, cH_count = extract_2d_sparse_coeffs(cH, threshold)
-            cV_vals, cV_coords, cV_rows, cV_cols, cV_count = extract_2d_sparse_coeffs(cV, threshold)
-            cD_vals, cD_coords, cD_rows, cD_cols, cD_count = extract_2d_sparse_coeffs(cD, threshold)
-            
+
+            # Extract sparse data for each band with per-level threshold
+            cH_vals, cH_coords, cH_rows, cH_cols, cH_count = extract_2d_sparse_coeffs(cH, level_threshold)
+            cV_vals, cV_coords, cV_rows, cV_cols, cV_count = extract_2d_sparse_coeffs(cV, level_threshold)
+            cD_vals, cD_coords, cD_rows, cD_cols, cD_count = extract_2d_sparse_coeffs(cD, level_threshold)
+
             level_total = cH.size + cV.size + cD.size
             level_significant = cH_count + cV_count + cD_count
             total_coeffs += level_total
             total_significant += level_significant
-            
+
             print(f"  Significant: cH={cH_count}/{cH.size}, cV={cV_count}/{cV.size}, cD={cD_count}/{cD.size}")
             print(f"  Level sparsity: {100*(1-level_significant/level_total):.2f}%")
-            
+
             # Store sparse data with indices for reconstruction
             band_data_per_level.append({
                 'cH': {'values': cH_vals, 'coords': cH_coords, 'rows': cH_rows, 'cols': cH_cols, 'shape': cH.shape},
                 'cV': {'values': cV_vals, 'coords': cV_coords, 'rows': cV_rows, 'cols': cV_cols, 'shape': cV.shape},
-                'cD': {'values': cD_vals, 'coords': cD_coords, 'rows': cD_rows, 'cols': cD_cols, 'shape': cD.shape}
+                'cD': {'values': cD_vals, 'coords': cD_coords, 'rows': cD_rows, 'cols': cD_cols, 'shape': cD.shape},
+                'threshold': level_threshold
             })
-        
+
         print(f"\nOverall sparsity: {100*(1-total_significant/total_coeffs):.2f}%")
         print(f"Total significant coefficients: {total_significant}/{total_coeffs}")
     else:
@@ -200,7 +209,7 @@ def main():
     adaptive_ll_size = max(16, int(base_ll_size * MODEL_SIZE_SCALE_LL))
     
     # More iterations for smaller models (they converge faster but need more epochs)
-    adaptive_ll_iters = 3000 if ll_pixels < 1000 else (2500 if ll_pixels < 3000 else MODEL_ITERATIONS)
+    adaptive_ll_iters = 2500 if ll_pixels < 1000 else (2000 if ll_pixels < 3000 else MODEL_ITERATIONS)
     
     print(f"\nAdaptive LL model: {adaptive_ll_layers} layers × {adaptive_ll_size} units ({adaptive_ll_iters} iters)")
     print(f"  (for {ll_pixels} LL coefficients, log={log_pixels:.2f})")
@@ -223,14 +232,14 @@ def main():
         
         # Layers: ~3 for 100 coeffs, ~5 for 500, ~8 for 2000, ~10 for 10k, ~13 for 30k+
         layers = max(3, min(MODEL_NUM_LAYERS, int(3.5 * log_coeffs - 4)))
-
+        
         # Size: ~32 for 100 coeffs, ~48 for 500, ~64 for 2000, ~80 for 10k, ~96 for 30k+
         base_size = max(32, min(MODEL_LAYER_SIZE, int(32 * log_coeffs - 32)))
         # Apply HF-specific width scale (smaller for compression)
         size = max(16, int(base_size * MODEL_SIZE_SCALE_HF))
         
         # Iterations: more for smaller datasets
-        iters = 3000 if num_coeffs < 5000 else (2500 if num_coeffs < 10000 else (1500 if num_coeffs < 20000 else MODEL_ITERATIONS))
+        iters = 2500 if num_coeffs < 1000 else (2000 if num_coeffs < 5000 else (1500 if num_coeffs < 20000 else MODEL_ITERATIONS))
         
         return layers, size, iters
     
@@ -324,19 +333,24 @@ def main():
     # Calculate and log model size metrics
     model_size_ll = util.model_size_in_bits(func_rep_ll) / 8000.
     print(f'\nLL Model size: {model_size_ll:.1f}kB')
+    print(f'  Architecture: {adaptive_ll_layers}L × {adaptive_ll_size}U')
     
     total_model_size = model_size_ll
     
     if USE_SPARSE_HF and band_models:
+        print(f'\nHF Models per band:')
         total_hf_size = 0
-        for level_models in band_models:
+        for level_idx, level_models in enumerate(band_models):
+            print(f'  Level {level_idx+1}:')
             for band_name, band_info in level_models.items():
                 band_size = util.model_size_in_bits(band_info['model']) / 8000.
                 total_hf_size += band_size
+                print(f'    {band_name}: {band_size:.1f}kB ({band_info["adaptive_layers"]}L × {band_info["adaptive_size"]}U)')
         
         print(f'HF Models total size: {total_hf_size:.1f}kB')
         total_model_size += total_hf_size
-        print(f'Total Model size: {total_model_size:.1f}kB')
+        print(f'Total Model size (FP32): {total_model_size:.1f}kB')
+        print(f'Total Model size (FP16): {total_model_size/2:.1f}kB')
     
     fp_bpp = util.bpp(model=func_rep_ll, image=coeffs_tensor)
     print(f'Full precision bpp (LL): {fp_bpp:.2f}')
@@ -439,7 +453,7 @@ def main():
         out_img.save(OUTPUT_FILE)
         
         # Calculate and print image-space PSNR
-        original_img = np.asarray(Image.open("kodak-dataset/kodim01.png").convert("L"))
+        original_img = np.asarray(Image.open(f"kodak-dataset/{IMAGEID}.png").convert("L"))
         img_psnr = util.calc_psnr(original_img, img_recon)
         print(f'Image-space PSNR: {img_psnr:.2f}')
         

@@ -15,8 +15,8 @@ import util
 LEVELS = 1        # Number of DWT decomposition levels
 WAVELET = "db4"   # Wavelet type: 'db1','db4','sym4', etc.
 LOG_DIR = "results/dwt"
-NUM_LAYERS = 20   # Number of layers in SIREN
-LAYER_SIZE = 56   # Hidden layer size
+NUM_LAYERS = 10   # Number of layers in SIREN
+LAYER_SIZE = 128   # Hidden layer size
 ITERATIONS = 2000 # Training iterations
 OUTPUT_FILE = f"dwt_siren_LL_only_levels{LEVELS}_{WAVELET}_{NUM_LAYERS}_{LAYER_SIZE}_{ITERATIONS}.png"
 
