@@ -47,6 +47,23 @@ def save_dwt_channel(channel_data, channel_name, imageid, levels, wavelet):
     # Multi-level 2D DWT
     coeffs = pywt.wavedec2(channel_data, wavelet=wavelet, level=levels)
     
+    # Print coefficient information
+    print(f"\n{channel_name} Channel DWT Coefficients:")
+    print(f"  LL (approx):")
+    print(f"    Shape: {coeffs[0].shape}")
+    print(f"    Min: {coeffs[0].min():.4f}, Max: {coeffs[0].max():.4f}, Mean: {coeffs[0].mean():.4f}, Std: {coeffs[0].std():.4f}")
+    print(f"    Sample values (top-left 3x3):\n{coeffs[0][:3, :3]}")
+    
+    for level_idx in range(1, len(coeffs)):
+        cH, cV, cD = coeffs[level_idx]
+        print(f"  Level {level_idx}:")
+        print(f"    cH: shape={cH.shape}, min={cH.min():.4f}, max={cH.max():.4f}, mean={cH.mean():.4f}, std={cH.std():.4f}")
+        print(f"        Sample (top-left 3x3):\n{cH[:3, :3]}")
+        print(f"    cV: shape={cV.shape}, min={cV.min():.4f}, max={cV.max():.4f}, mean={cV.mean():.4f}, std={cV.std():.4f}")
+        print(f"        Sample (top-left 3x3):\n{cV[:3, :3]}")
+        print(f"    cD: shape={cD.shape}, min={cD.min():.4f}, max={cD.max():.4f}, mean={cD.mean():.4f}, std={cD.std():.4f}")
+        print(f"        Sample (top-left 3x3):\n{cD[:3, :3]}")
+    
     # Convert coefficients to a single array
     arr, slices = pywt.coeffs_to_array(coeffs)
     

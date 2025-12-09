@@ -11,6 +11,7 @@ from torchvision import transforms
 from torchvision.utils import save_image
 from training import Trainer
 
+# python main.py -iid 2 -lss 40 -nl 10 -ni 1000
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-ld", "--logdir", help="Path to save logs", default="./results/siren_main")
@@ -94,6 +95,11 @@ for i in range(min_id, max_id + 1):
     # Save full precision image reconstruction
     with torch.no_grad():
         img_recon = func_rep(coordinates).reshape(img.shape[1], img.shape[2], 3).permute(2, 0, 1)
+        
+        # Calculate image-level PSNR for full precision
+        fp_img_psnr = util.get_clamped_psnr(img_recon, img)
+        print(f'Full precision image PSNR: {fp_img_psnr:.2f} dB')
+        
         save_image(torch.clamp(img_recon, 0, 1).to('cpu'), args.logdir + f'/fp_reconstruction_{i}.png')
 
     # Convert model and coordinates to half precision. Note that half precision
@@ -112,7 +118,7 @@ for i in range(min_id, max_id + 1):
             img_recon = func_rep(coordinates).reshape(img.shape[1], img.shape[2], 3).permute(2, 0, 1).float()
             hp_psnr = util.get_clamped_psnr(img_recon, img)
             save_image(torch.clamp(img_recon, 0, 1).to('cpu'), args.logdir + f'/hp_reconstruction_{i}.png')
-            print(f'Half precision psnr: {hp_psnr:.2f}')
+            print(f'Half precision image PSNR: {hp_psnr:.2f} dB')
             results['hp_psnr'].append(hp_psnr)
     else:
         results['hp_bpp'].append(fp_bpp)

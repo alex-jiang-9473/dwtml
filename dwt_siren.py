@@ -12,19 +12,23 @@ import util
 
 # ---------------------------
 # CONFIG
+IMAGEID = "kodim01"  # Image to compress
 LEVELS = 1        # Number of DWT decomposition levels
 WAVELET = "db4"   # Wavelet type: 'db1','db4','sym4', etc.
 LOG_DIR = "results/dwt"
-NUM_LAYERS = 20   # Number of layers in SIREN
+NUM_LAYERS = 10   # Number of layers in SIREN
 LAYER_SIZE = 56   # Hidden layer size
-ITERATIONS = 2000 # Training iterations
-OUTPUT_FILE = f"dwt_siren_levels{LEVELS}_{WAVELET}_{NUM_LAYERS}_{LAYER_SIZE}_{ITERATIONS}.png"
+ITERATIONS = 5000 # Training iterations
+OUTPUT_FILE = os.path.join(LOG_DIR, f"{IMAGEID}_dwt_siren_L{NUM_LAYERS}_S{LAYER_SIZE}_I{ITERATIONS}.png")
 
 # ---------------------------
 
 def main():
+    import time
+    start_time = time.time()
+    
     # 1) Load and prepare grayscale image
-    img = Image.open("kodak-dataset/kodim01.png").convert("L")
+    img = Image.open(f"kodak-dataset/{IMAGEID}.png").convert("L")
     A = np.asarray(img, dtype=np.float32)
 
     # 2) Perform multi-level 2D DWT
@@ -32,6 +36,23 @@ def main():
 
     # 3) Convert coefficients to array and normalize
     arr, slices = pywt.coeffs_to_array(coeffs)
+
+    # Save coefficients for further analysis
+    coeffs_file = os.path.join(LOG_DIR, f'{IMAGEID}_coeffs_L{LEVELS}_{WAVELET}.npz')
+    os.makedirs(LOG_DIR, exist_ok=True)
+    
+    # Convert slices to a saveable format
+    slices_list = [str(s) for s in slices]  # Convert slices to strings
+    
+    np.savez_compressed(
+        coeffs_file,
+        coeffs_array=arr,
+        slices_str=slices_list,  # Save as strings
+        image_shape=A.shape,
+        wavelet=WAVELET,
+        levels=LEVELS
+    )
+    print(f"Coefficients saved to: {coeffs_file}")
 
     # Normalize coefficients for training stability
     arr_mean = arr.mean()
@@ -86,15 +107,20 @@ def main():
     print(f'Full precision bpp: {fp_bpp:.2f}')
 
     # Train the model
+    train_start = time.time()
     trainer.train(coordinates, features, num_iters=ITERATIONS)
+    train_end = time.time()
+    training_time = train_end - train_start
     print(f'Best training psnr: {trainer.best_vals["psnr"]:.2f}')
+    print(f'Training time: {training_time:.2f} seconds')
 
     # Log full precision results
     results['fp_bpp'].append(fp_bpp)
     results['fp_psnr'].append(trainer.best_vals['psnr'])
 
     # Save best model
-    torch.save(trainer.best_model, os.path.join(LOG_DIR, 'best_model_dwt.pt'))
+    best_model_file = f'best_model_dwt_L{NUM_LAYERS}_S{LAYER_SIZE}_I{ITERATIONS}.pt'
+    torch.save(trainer.best_model, os.path.join(LOG_DIR, best_model_file))
 
     # Load best model and convert to half precision
     func_rep.load_state_dict(trainer.best_model)
@@ -117,11 +143,6 @@ def main():
         original_coeffs = torch.tensor(arr).to(device, dtype)
         hp_psnr = util.get_clamped_psnr(original_coeffs, coeffs_recon_denorm)
         
-        # Save metrics
-        results_file = os.path.join(LOG_DIR, 'metrics.json')
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=4)
-        
         # Convert reconstructed coefficients for inverse DWT
         coeffs_np = coeffs_recon_denorm.cpu().numpy()
         coeffs_recon_list = pywt.array_to_coeffs(coeffs_np, slices, output_format='wavedec2')
@@ -135,12 +156,90 @@ def main():
         out_img.save(OUTPUT_FILE)
         
         # Calculate and print image-space PSNR
-        original_img = np.asarray(Image.open("kodak-dataset/kodim01.png").convert("L"))
+        original_img = np.asarray(Image.open(f"kodak-dataset/{IMAGEID}.png").convert("L"))
         img_psnr = util.calc_psnr(original_img, img_recon)
         print(f'Image-space PSNR: {img_psnr:.2f}')
         
         print(f'Half precision PSNR: {hp_psnr:.2f}')
         results['hp_psnr'].append(hp_psnr)
+        
+        # Calculate total parameters
+        total_params = sum(p.numel() for p in func_rep.parameters())
+        
+        # Get GPU memory usage (if available)
+        gpu_memory_mb = 0
+        if torch.cuda.is_available():
+            gpu_memory_mb = torch.cuda.max_memory_allocated() / 1024**2  # Convert to MB
+            torch.cuda.reset_peak_memory_stats()
+        
+        # Calculate total execution time
+        total_time = time.time() - start_time
+        
+        # Compile comprehensive results for plotting
+        plot_results = {
+            'config': {
+                'image_id': IMAGEID,
+                'num_layers': NUM_LAYERS,
+                'layer_size': LAYER_SIZE,
+                'iterations': ITERATIONS,
+                'wavelet': WAVELET,
+                'dwt_levels': LEVELS
+            },
+            'image': {
+                'original_shape': list(A.shape),
+                'original_size_bytes': int(A.size),
+                'original_size_kb': float(A.size / 1024.0)
+            },
+            'coefficients': {
+                'total_count': int(arr.size),
+                'shape': list(arr.shape),
+                'min': float(arr.min()),
+                'max': float(arr.max()),
+                'mean': float(arr.mean()),
+                'std': float(arr.std())
+            },
+            'model': {
+                'total_parameters': total_params,
+                'model_size_kb': model_size,
+                'model_architecture': f"{NUM_LAYERS}×{LAYER_SIZE}"
+            },
+            'compression': {
+                'fp32_bpp': fp_bpp,
+                'fp16_bpp': hp_bpp,
+                'original_size_kb': A.size / 1024.0,
+                'compressed_size_kb': model_size,
+                'compression_ratio': (A.size / 1024.0) / model_size
+            },
+            'quality': {
+                'fp32_psnr': trainer.best_vals['psnr'],
+                'fp16_psnr': float(hp_psnr),
+                'image_space_psnr': float(img_psnr),
+                'best_training_loss': trainer.best_vals.get('loss', None)
+            },
+            'training': {
+                'iterations': ITERATIONS,
+                'learning_rate': 2e-4,
+                'seed': seed,
+                'training_time_sec': float(training_time),
+                'total_time_sec': float(total_time)
+            },
+            'hardware': {
+                'gpu_memory_mb': float(gpu_memory_mb),
+                'device': str(device)
+            }
+        }
+        
+        # Save comprehensive results
+        results_file = os.path.join(LOG_DIR, f'{IMAGEID}_results_L{NUM_LAYERS}_S{LAYER_SIZE}_I{ITERATIONS}.json')
+        with open(results_file, 'w') as f:
+            json.dump(plot_results, f, indent=2)
+        
+        print(f"\nResults saved to: {results_file}")
+        print(f"Model: {NUM_LAYERS} layers × {LAYER_SIZE} units = {total_params:,} params")
+        print(f"Compression: {plot_results['compression']['compression_ratio']:.2f}x")
+        print(f"Total time: {total_time:.2f} seconds")
+        if gpu_memory_mb > 0:
+            print(f"Peak GPU memory: {gpu_memory_mb:.2f} MB")
 
     print("DWT Results:", results)
 

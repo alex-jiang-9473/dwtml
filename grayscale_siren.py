@@ -11,10 +11,10 @@ import util
 
 # ---------------------------
 # CONFIG
-IMAGEID = "kodim02"
+IMAGEID = "kodim01"
 LOG_DIR = "results/grayscale"
 NUM_LAYERS = 15
-LAYER_SIZE = 110
+LAYER_SIZE = 80
 ITERATIONS = 1000
 OUTPUT_FILE = f"siren_{IMAGEID}_L{NUM_LAYERS}_N{LAYER_SIZE}_I{ITERATIONS}.png"
 

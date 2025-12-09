@@ -6,7 +6,6 @@ import numpy as np
 import pywt
 import torch
 from PIL import Image
-from torchvision import transforms
 from training import Trainer
 from siren import Siren
 import util
@@ -14,515 +13,776 @@ import util
 # ---------------------------
 # CONFIG
 LEVELS = 2        # Number of DWT decomposition levels
-WAVELET = "db4"   # Wavelet type: 'db1','db4','sym4', etc.
+WAVELET = "db4"   # Wavelet type
 LOG_DIR = "results/dwt_2d_bands_yuv"
+IMAGEID = "kodim01"  # Image to compress
 
-# Chroma subsampling (4:2:0 standard)
-USE_CHROMA_SUBSAMPLING = True  # True: 4:2:0 subsampling for UV channels
-CHROMA_SUBSAMPLE_FACTOR = 2    # Downsample UV by this factor in each dimension
+# Model sizing parameters (same as grayscale version)
+MODEL_SIZE_SCALE_LL = 0.8  # LL gets 64% of total parameters
+MODEL_SIZE_SCALE_HF = 0.6  # Each HF gets 36% of total parameters
+THRESHOLD_FACTOR = 1.0     # Sparsity threshold (1.0 * std)
 
-# # Model Configuration (Maximum/Fallback - Adaptive sizing based on coefficient count)
-# MODEL_NUM_LAYERS = 40   # Max layers for very large inputs
-# MODEL_LAYER_SIZE = 128  # Max hidden units for large inputs
-# MODEL_ITERATIONS = 2000 # Max training iterations
-
-# # Model width scaling - different for Y vs UV channels
-# MODEL_SIZE_SCALE_Y_LL = 0.6  # Y LL model scale
-# MODEL_SIZE_SCALE_Y_HF = 0.5  # Y HF model scale
-# MODEL_SIZE_SCALE_UV_LL = 0.25  # UV LL model scale (aggressive - ~6% params)
-# MODEL_SIZE_SCALE_UV_HF = 0.15  # UV HF model scale (aggressive - ~2% params)
-
-
-# Model Configuration (Maximum/Fallback - Adaptive sizing based on coefficient count)
-MODEL_NUM_LAYERS = 20   # Max layers (reduced from 40 for smaller model)
-MODEL_LAYER_SIZE = 64   # Max hidden units (reduced from 128 for smaller model)
-MODEL_ITERATIONS = 1000 # Max training iterations (reduced from 2000 for faster training)
-
-# Model width scaling - different for Y vs UV channels
-MODEL_SIZE_SCALE_Y_LL = 0.4   # Y LL model scale (reduced from 0.6)
-MODEL_SIZE_SCALE_Y_HF = 0.3   # Y HF model scale (reduced from 0.5)
-MODEL_SIZE_SCALE_UV_LL = 0.2  # UV LL model scale (reduced from 0.25)
-MODEL_SIZE_SCALE_UV_HF = 0.1  # UV HF model scale (reduced from 0.15)
-
-
-# High-frequency coefficient handling
-USE_SPARSE_HF = False  # True: Use sparse threshold training for HF
-THRESHOLD_FACTOR = 1  # Keep coefficients above this * std
-LEVEL_THRESHOLD_GAMMA = 0.8  # Per-level threshold scaling
-
-IMAGEID = "kodim02"
-
-OUTPUT_FILE = f"{IMAGEID}_dwt_yuv_levels{LEVELS}_{WAVELET}_thresh{THRESHOLD_FACTOR}_gamma{LEVEL_THRESHOLD_GAMMA}.png"
-
-# ---------------------------
-
-def extract_2d_sparse_coeffs(band, threshold):
-    """Extract sparse coefficients with their 2D coordinates from a band"""
-    significant_mask = np.abs(band) > threshold
-    rows, cols = np.where(significant_mask)
-    values = band[rows, cols]
+def rgb_to_yuv(rgb_img):
+    """Convert RGB image to YUV color space (BT.601)
     
-    h, w = band.shape
-    coords_y = (rows / (h - 1)) * 2 - 1
-    coords_x = (cols / (w - 1)) * 2 - 1
-    coords = np.stack([coords_x, coords_y], axis=1)
+    Note: Works with [0, 255] range to match grayscale version
+    """
+    rgb = np.array(rgb_img, dtype=np.float32)  # Keep [0, 255] range
     
-    return values, coords, rows, cols, significant_mask.sum()
+    # BT.601 conversion matrix
+    mat = np.array([
+        [0.299, 0.587, 0.114],
+        [-0.168736, -0.331264, 0.5],
+        [0.5, -0.418688, -0.081312]
+    ])
+    
+    yuv = np.dot(rgb, mat.T)
+    yuv[:, :, 1:] += 128.0  # U and V channels centered at 128 (like in [0,255] space)
+    
+    return yuv
 
-def process_channel_dwt(channel_data, channel_name, ll_scale, hf_scale, is_chroma=False):
-    """Process DWT for a single channel and return models and data"""
+def yuv_to_rgb(yuv):
+    """Convert YUV color space back to RGB (BT.601)
+    
+    Note: Works with [0, 255] range
+    """
+    yuv_copy = yuv.copy()
+    yuv_copy[:, :, 1:] -= 128.0  # Remove U/V centering
+    
+    # BT.601 inverse matrix
+    mat = np.array([
+        [1.0, 0.0, 1.402],
+        [1.0, -0.344136, -0.714136],
+        [1.0, 1.772, 0.0]
+    ])
+    
+    rgb = np.dot(yuv_copy, mat.T)
+    rgb = np.clip(rgb, 0, 255)
+    
+    return rgb.astype(np.uint8)
+
+def get_adaptive_ll_lr(ll_coeffs):
+    """Calculate adaptive learning rate for LL band (YUV version)
+    
+    Uses same formula as grayscale but applied to Y channel stats
+    Reduces LR for larger models to prevent divergence
+    """
+    # Use Y channel statistics for LR calculation
+    y_channel = ll_coeffs[:, :, 0]
+    coeff_std = np.std(y_channel)
+    coeff_range = np.max(y_channel) - np.min(y_channel)
+    num_pixels = y_channel.size
+    
+    # Base LR depends on dataset size (aggressively reduced for large models)
+    if num_pixels > 50000:
+        base_lr = 8e-5   # Reduced from 1.2e-4
+    elif num_pixels > 20000:
+        base_lr = 1e-4   # Reduced from 1.5e-4
+    elif num_pixels > 10000:
+        base_lr = 1.2e-4  # Reduced from 2e-4
+    elif num_pixels > 5000:
+        base_lr = 1.5e-4  # Reduced from 2.5e-4
+    else:
+        base_lr = 2e-4   # Reduced from 3e-4
+    
+    # Variance factor (higher std = more variation = higher LR) - further reduced
+    variance_factor = 1.0 + np.log10(max(coeff_std, 1.0)) / 7.0  # Reduced from /5.0
+    
+    # Range factor (wider range = more learning needed = higher LR) - further reduced
+    range_factor = 1.0 + np.log10(max(coeff_range, 1.0)) / 8.0  # Reduced from /6.0
+    
+    # Size factor (fewer pixels = can use higher LR) - further reduced impact
+    size_factor = 1.0 + (50000 - num_pixels) / 300000  # Reduced from /200000
+    
+    lr = base_lr * variance_factor * range_factor * size_factor
+    lr = np.clip(lr, 5e-5, 2e-4)  # Reduced range: was [1e-4, 3e-4], now [5e-5, 2e-4]
+    
+    return lr
+
+def get_adaptive_hf_lr(hf_coeffs, band_name, dwt_level):
+    """Calculate adaptive learning rate for HF band (YUV version)
+    
+    Uses Y channel for sparse detection and statistics
+    """
+    # Use Y channel for statistics
+    y_channel = hf_coeffs[:, :, 0]
+    
+    # Sparsity calculation
+    threshold = THRESHOLD_FACTOR * np.std(y_channel)
+    sparse_mask = np.abs(y_channel) > threshold
+    num_coeffs = np.sum(sparse_mask)
+    sparsity_ratio = num_coeffs / y_channel.size
+    
+    # Base LR depends on coefficient count (aggressively reduced)
+    if num_coeffs > 10000:
+        base_lr = 1.2e-4  # Reduced from 2e-4
+    elif num_coeffs > 5000:
+        base_lr = 8e-5    # Reduced from 1.2e-4
+    else:
+        base_lr = 2e-4    # Reduced from 3e-4
+    
+    # Count factor (fewer coeffs = higher LR) - further reduced
+    if num_coeffs < 1000:
+        count_factor = 1.2  # Reduced from 1.4
+    elif num_coeffs < 5000:
+        count_factor = 1.1  # Reduced from 1.2
+    else:
+        count_factor = 1.0
+    
+    # Variance factor - further reduced impact
+    coeff_std = np.std(y_channel[sparse_mask]) if num_coeffs > 0 else 1.0
+    variance_factor = 1.0 + np.log10(max(coeff_std, 1.0)) / 5.0  # Reduced from /4.0
+    
+    # Sparsity factor (sparser = fewer examples = higher LR) - further reduced impact
+    sparsity_factor = 1.0 + (0.5 - sparsity_ratio) / 4.0  # Reduced from /3.0
+    
+    # Level factor (finer levels = more details = slightly higher LR) - further reduced
+    level_factor = 1.0 + dwt_level * 0.03  # Reduced from 0.05
+    
+    lr = base_lr * count_factor * variance_factor * sparsity_factor * level_factor
+    lr = np.clip(lr, 5e-5, 3e-4)  # Reduced max from 5e-4 to 3e-4
+    
+    return lr, num_coeffs
+
+def get_model_size(ll_coeffs, hf_coeffs, band_name):
+    """Calculate adaptive model size for LL or HF bands (YUV version)
+    
+    Returns (layers, hidden_size) based on coefficient count
+    Uses Y channel for sizing decisions, but scales up for 3-channel output
+    """
     import math
     
-    # Perform DWT
-    coeffs = pywt.wavedec2(channel_data, wavelet=WAVELET, level=LEVELS)
-    ll_coeffs = coeffs[0]
-    
-    print(f"\n=== {channel_name} Channel ===")
-    print(f"LL coefficients shape: {ll_coeffs.shape}")
-    
-    # Storage for band data
-    band_data_per_level = []
-    
-    if USE_SPARSE_HF:
-        # Collect all HF coefficients
-        all_hf_coeffs = []
-        for level_idx in range(1, len(coeffs)):
-            cH, cV, cD = coeffs[level_idx]
-            all_hf_coeffs.extend(cH.flatten())
-            all_hf_coeffs.extend(cV.flatten())
-            all_hf_coeffs.extend(cD.flatten())
-        all_hf_coeffs = np.array(all_hf_coeffs)
-
-        hf_std = np.std(all_hf_coeffs)
-        base_threshold = THRESHOLD_FACTOR * hf_std
+    if ll_coeffs is not None:
+        # LL band sizing based on total pixels
+        y_channel = ll_coeffs[:, :, 0]
+        num_coeffs = y_channel.size
         
-        print(f"HF std: {hf_std:.2f}, Base threshold: {base_threshold:.2f}")
-
-        total_coeffs = 0
-        total_significant = 0
-
-        # Extract sparse coefficients
-        for level_idx in range(1, len(coeffs)):
-            cH, cV, cD = coeffs[level_idx]
-            level_threshold = base_threshold * (LEVEL_THRESHOLD_GAMMA ** (level_idx - 1))
-
-            cH_vals, cH_coords, cH_rows, cH_cols, cH_count = extract_2d_sparse_coeffs(cH, level_threshold)
-            cV_vals, cV_coords, cV_rows, cV_cols, cV_count = extract_2d_sparse_coeffs(cV, level_threshold)
-            cD_vals, cD_coords, cD_rows, cD_cols, cD_count = extract_2d_sparse_coeffs(cD, level_threshold)
-
-            level_total = cH.size + cV.size + cD.size
-            level_significant = cH_count + cV_count + cD_count
-            total_coeffs += level_total
-            total_significant += level_significant
-
-            print(f"Level {level_idx}: Significant {level_significant}/{level_total} ({100*level_significant/level_total:.1f}%)")
-
-            band_data_per_level.append({
-                'cH': {'values': cH_vals, 'coords': cH_coords, 'rows': cH_rows, 'cols': cH_cols, 'shape': cH.shape},
-                'cV': {'values': cV_vals, 'coords': cV_coords, 'rows': cV_rows, 'cols': cV_cols, 'shape': cV.shape},
-                'cD': {'values': cD_vals, 'coords': cD_coords, 'rows': cD_rows, 'cols': cD_cols, 'shape': cD.shape},
-                'threshold': level_threshold
-            })
-
-        print(f"Overall sparsity: {100*(1-total_significant/total_coeffs):.2f}%")
+        log_coeffs = math.log10(max(num_coeffs, 10))
+        
+        # Layers: ~3 for 100 coeffs, ~5 for 500, ~8 for 2000, ~12 for 5000+
+        layers = max(3, min(15, int(3.5 * log_coeffs - 4)))
+        
+        # Size: ~32 for 100, ~56 for 500, ~72 for 2000, ~96 for 5000+
+        # Scale up by 1.2x for 3-channel output
+        base_size = max(32, min(128, int(32 * log_coeffs - 32)))
+        size = max(32, int(base_size * MODEL_SIZE_SCALE_LL * 1.2))
     else:
-        for level_idx in range(1, len(coeffs)):
-            cH, cV, cD = coeffs[level_idx]
-            band_data_per_level.append({
-                'cH': {'values': np.array([]), 'coords': np.array([]), 'shape': cH.shape},
-                'cV': {'values': np.array([]), 'coords': np.array([]), 'shape': cV.shape},
-                'cD': {'values': np.array([]), 'coords': np.array([]), 'shape': cD.shape}
-            })
+        # HF band sizing based on sparse Y coefficients
+        y_channel = hf_coeffs[:, :, 0]
+        threshold = THRESHOLD_FACTOR * np.std(y_channel)
+        sparse_mask = np.abs(y_channel) > threshold
+        num_coeffs = np.sum(sparse_mask)
+        
+        log_coeffs = math.log10(max(num_coeffs, 10))
+        
+        # Layers: ~3 for 100, ~5 for 500, ~8 for 2000, ~10 for 10k, ~13 for 30k+
+        layers = max(3, min(15, int(3.5 * log_coeffs - 4)))
+        
+        # Size: ~32 for 100, ~48 for 500, ~64 for 2000, ~80 for 10k, ~96 for 30k+
+        # Scale up by 1.3x for 3-channel output (HF needs more capacity than LL)
+        base_size = max(32, min(128, int(32 * log_coeffs - 32)))
+        size = max(32, int(base_size * MODEL_SIZE_SCALE_HF * 1.3))
+    
+    return layers, size
 
-    # Setup device
-    dtype = torch.float32
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def train_ll_band(ll_coeffs_yuv, device):
+    """Train a single LL model with 3 outputs (Y, U, V)
     
-    # Normalize LL coefficients
-    ll_mean = ll_coeffs.mean()
-    ll_std = ll_coeffs.std()
-    ll_norm = (ll_coeffs - ll_mean) / (ll_std + 1e-8)
+    Args:
+        ll_coeffs_yuv: (H, W, 3) array with Y, U, V channels
+        device: torch device
     
-    coeffs_tensor = transforms.ToTensor()(ll_norm).float().to(device, dtype)
-
-    # Adaptive LL model sizing
-    ll_h, ll_w = ll_coeffs.shape
-    ll_pixels = ll_h * ll_w
-    log_pixels = math.log10(max(ll_pixels, 10))
+    Returns:
+        Trained model, metrics dict
+    """
+    h, w, _ = ll_coeffs_yuv.shape
     
-    adaptive_ll_layers = max(3, min(MODEL_NUM_LAYERS, int(3.5 * log_pixels - 4)))
-    base_ll_size = max(32, min(MODEL_LAYER_SIZE, int(32 * log_pixels - 32)))
-    adaptive_ll_size = max(16, int(base_ll_size * ll_scale))
-    adaptive_ll_iters = 2500 if ll_pixels < 1000 else (2000 if ll_pixels < 3000 else MODEL_ITERATIONS)
+    # Normalize each channel separately
+    ll_y_norm = ll_coeffs_yuv[:, :, 0]
+    ll_u_norm = ll_coeffs_yuv[:, :, 1]
+    ll_v_norm = ll_coeffs_yuv[:, :, 2]
     
-    # Reduce iterations for chroma channels (U/V)
-    if is_chroma:
-        adaptive_ll_iters = min(1000, adaptive_ll_iters // 3)
+    y_mean, y_std = np.mean(ll_y_norm), np.std(ll_y_norm)
+    u_mean, u_std = np.mean(ll_u_norm), np.std(ll_u_norm)
+    v_mean, v_std = np.mean(ll_v_norm), np.std(ll_v_norm)
     
-    print(f"LL model: {adaptive_ll_layers}L × {adaptive_ll_size}U ({adaptive_ll_iters} iters)")
-
-    # Create LL model
-    func_rep_ll = Siren(
+    ll_y_norm = (ll_y_norm - y_mean) / (y_std + 1e-8)
+    ll_u_norm = (ll_u_norm - u_mean) / (u_std + 1e-8)
+    ll_v_norm = (ll_v_norm - v_mean) / (v_std + 1e-8)
+    
+    # Create coordinate grid [-1, 1] x [-1, 1]
+    y_coords = np.linspace(-1, 1, h)
+    x_coords = np.linspace(-1, 1, w)
+    yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
+    coords = np.stack([yy.flatten(), xx.flatten()], axis=1)
+    coords_tensor = torch.FloatTensor(coords).to(device)
+    
+    # Stack normalized coefficients (N, 3) - Y, U, V
+    ll_tensor = torch.stack([
+        torch.FloatTensor(ll_y_norm.flatten()),
+        torch.FloatTensor(ll_u_norm.flatten()),
+        torch.FloatTensor(ll_v_norm.flatten())
+    ], dim=1).to(device)
+    
+    # Get model architecture
+    layers, hidden_size = get_model_size(ll_coeffs_yuv, None, "LL")
+    ll_lr = get_adaptive_ll_lr(ll_coeffs_yuv)
+    
+    # Adaptive iterations
+    num_pixels = h * w
+    if num_pixels < 5000:
+        iterations = 3000
+    elif num_pixels < 20000:
+        iterations = 2000
+    else:
+        iterations = 1500
+    
+    print(f"\n{'='*60}")
+    print(f"Training LL band (YUV) - {h}x{w} = {num_pixels} pixels")
+    print(f"  Y: mean={y_mean:.3f}, std={y_std:.3f}")
+    print(f"  U: mean={u_mean:.3f}, std={u_std:.3f}")
+    print(f"  V: mean={v_mean:.3f}, std={v_std:.3f}")
+    print(f"  Model: {layers} layers x {hidden_size} units")
+    print(f"  LR: {ll_lr:.2e}, Iterations: {iterations}")
+    print(f"{'='*60}")
+    
+    # Create model with 3 outputs
+    model_ll = Siren(
         dim_in=2,
-        dim_hidden=adaptive_ll_size,
-        dim_out=1,
-        num_layers=adaptive_ll_layers,
-        final_activation=torch.nn.Identity(),
+        dim_hidden=hidden_size,
+        dim_out=3,  # Y, U, V channels
+        num_layers=layers,
+        final_activation=None,
         w0_initial=30.0,
         w0=30.0
-    )
+    ).to(device)
     
-    # Helper function for adaptive HF parameters
-    def get_adaptive_hf_params(num_coeffs):
-        log_coeffs = math.log10(max(num_coeffs, 10))
-        layers = max(3, min(MODEL_NUM_LAYERS, int(3.5 * log_coeffs - 4)))
-        base_size = max(32, min(MODEL_LAYER_SIZE, int(32 * log_coeffs - 32)))
-        size = max(16, int(base_size * hf_scale))
-        iters = 2500 if num_coeffs < 1000 else (2000 if num_coeffs < 5000 else (1500 if num_coeffs < 20000 else MODEL_ITERATIONS))
-        
-        # Reduce iterations for chroma channels (U/V)
-        if is_chroma:
-            iters = min(800, iters // 3)
-        
-        return layers, size, iters
+    # Train
+    trainer = Trainer(model_ll, lr=ll_lr)
+    trainer.train(coords_tensor, ll_tensor, num_iters=iterations)
     
-    # Initialize HF models
-    band_models = []
-    
-    if USE_SPARSE_HF:
-        for level_idx, level_data in enumerate(band_data_per_level):
-            level_models = {}
-            
-            for band_name in ['cH', 'cV', 'cD']:
-                if len(level_data[band_name]['values']) > 0:
-                    num_coeffs = len(level_data[band_name]['values'])
-                    hf_layers, hf_size, hf_iters = get_adaptive_hf_params(num_coeffs)
-                    
-                    model = Siren(
-                        dim_in=2,
-                        dim_hidden=hf_size,
-                        dim_out=1,
-                        num_layers=hf_layers,
-                        final_activation=torch.nn.Identity(),
-                        w0_initial=30.0,
-                        w0=30.0
-                    )
-                    level_models[band_name] = {
-                        'model': model,
-                        'values': level_data[band_name]['values'],
-                        'coords': level_data[band_name]['coords'],
-                        'rows': level_data[band_name]['rows'],
-                        'cols': level_data[band_name]['cols'],
-                        'shape': level_data[band_name]['shape'],
-                        'adaptive_layers': hf_layers,
-                        'adaptive_size': hf_size,
-                        'adaptive_iters': hf_iters
-                    }
-            
-            band_models.append(level_models)
-
-    return {
-        'll_coeffs': ll_coeffs,
-        'll_mean': ll_mean,
-        'll_std': ll_std,
-        'll_norm': ll_norm,
-        'coeffs_tensor': coeffs_tensor,
-        'func_rep_ll': func_rep_ll,
-        'adaptive_ll_layers': adaptive_ll_layers,
-        'adaptive_ll_size': adaptive_ll_size,
-        'adaptive_ll_iters': adaptive_ll_iters,
-        'band_models': band_models,
-        'band_data_per_level': band_data_per_level
-    }
-
-def train_channel_models(channel_data, channel_name):
-    """Train all models for a channel"""
-    dtype = torch.float32
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Train LL model
-    print(f"\n=== Training {channel_name} LL Model ===")
-    trainer_ll = Trainer(channel_data['func_rep_ll'], lr=2e-4)
-    coordinates_ll, features_ll = util.to_coordinates_and_coeffs_features(channel_data['coeffs_tensor'])
-    coordinates_ll, features_ll = coordinates_ll.to(device, dtype), features_ll.to(device, dtype)
-    
-    trainer_ll.train(coordinates_ll, features_ll, num_iters=channel_data['adaptive_ll_iters'])
-    print(f'Best {channel_name} LL PSNR: {trainer_ll.best_vals["psnr"]:.2f}')
-    
-    channel_data['trainer_ll'] = trainer_ll
-    channel_data['coordinates_ll'] = coordinates_ll
-    
-    # Train HF models
-    if USE_SPARSE_HF and channel_data['band_models']:
-        print(f"\n=== Training {channel_name} HF Models ===")
-        for level_idx, level_models in enumerate(channel_data['band_models']):
-            for band_name in ['cH', 'cV', 'cD']:
-                if band_name in level_models:
-                    band_info = level_models[band_name]
-                    num_coeffs = len(band_info['values'])
-                    
-                    print(f"  Level {level_idx+1} {band_name}: {band_info['adaptive_layers']}L×{band_info['adaptive_size']}U ({num_coeffs} coeffs)")
-                    
-                    # Normalize
-                    values = band_info['values']
-                    val_mean = values.mean()
-                    val_std = values.std()
-                    val_norm = (values - val_mean) / (val_std + 1e-8)
-                    
-                    band_info['mean'] = val_mean
-                    band_info['std'] = val_std
-                    
-                    # Train
-                    coords_tensor = torch.tensor(band_info['coords'], dtype=torch.float32).to(device, dtype)
-                    features_tensor = torch.tensor(val_norm.reshape(-1, 1), dtype=torch.float32).to(device, dtype)
-                    
-                    trainer = Trainer(band_info['model'], lr=2e-4)
-                    trainer.train(coords_tensor, features_tensor, num_iters=band_info['adaptive_iters'])
-                    
-                    print(f"    → PSNR={trainer.best_vals['psnr']:.2f}")
-                    band_info['trainer'] = trainer
-
-def reconstruct_channel(channel_data, channel_name):
-    """Reconstruct a channel from trained models"""
-    dtype = torch.float32
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Load best LL model
-    channel_data['func_rep_ll'].load_state_dict(channel_data['trainer_ll'].best_model)
-    channel_data['func_rep_ll'] = channel_data['func_rep_ll'].half().to('cuda')
-    coordinates_ll = channel_data['coordinates_ll'].half().to('cuda')
-    
-    # Load best HF models
-    if USE_SPARSE_HF:
-        for level_models in channel_data['band_models']:
-            for band_name, band_info in level_models.items():
-                band_info['model'].load_state_dict(band_info['trainer'].best_model)
-                band_info['model'] = band_info['model'].half().to('cuda')
-
+    # Calculate final PSNR per channel
     with torch.no_grad():
-        # Reconstruct LL
-        ll_recon = channel_data['func_rep_ll'](coordinates_ll).reshape(
-            channel_data['coeffs_tensor'].shape[1], 
-            channel_data['coeffs_tensor'].shape[2]
-        ).float()
-        ll_recon_denorm = ll_recon * (channel_data['ll_std'] + 1e-8) + channel_data['ll_mean']
-        ll_recon_np = ll_recon_denorm.cpu().numpy()
+        pred = model_ll(coords_tensor)
         
-        # Build coefficient structure
-        coeffs_modified = [ll_recon_np]
+        # Y channel PSNR
+        y_pred_norm = pred[:, 0].cpu()
+        y_pred = y_pred_norm * (y_std + 1e-8) + y_mean
+        y_true = torch.FloatTensor(ll_coeffs_yuv[:, :, 0].flatten())
+        y_psnr = util.get_clamped_psnr(y_true, y_pred)
         
-        # Reconstruct HF bands
-        if USE_SPARSE_HF:
-            for level_idx, level_models in enumerate(channel_data['band_models']):
-                cH_recon = np.zeros(channel_data['band_data_per_level'][level_idx]['cH']['shape'])
-                cV_recon = np.zeros(channel_data['band_data_per_level'][level_idx]['cV']['shape'])
-                cD_recon = np.zeros(channel_data['band_data_per_level'][level_idx]['cD']['shape'])
-                
-                for band_name, band_array in [('cH', cH_recon), ('cV', cV_recon), ('cD', cD_recon)]:
-                    if band_name in level_models:
-                        band_info = level_models[band_name]
-                        
-                        trained_coords_tensor = torch.tensor(band_info['coords'], dtype=torch.float32).to(device).half()
-                        predictions = band_info['model'](trained_coords_tensor).reshape(-1).float()
-                        predictions_denorm = predictions * (band_info['std'] + 1e-8) + band_info['mean']
-                        predictions_np = predictions_denorm.cpu().numpy()
-                        
-                        band_array[band_info['rows'], band_info['cols']] = predictions_np
-                
-                coeffs_modified.append((cH_recon, cV_recon, cD_recon))
-        else:
-            for level_data in channel_data['band_data_per_level']:
-                cH_zero = np.zeros(level_data['cH']['shape'])
-                cV_zero = np.zeros(level_data['cV']['shape'])
-                cD_zero = np.zeros(level_data['cD']['shape'])
-                coeffs_modified.append((cH_zero, cV_zero, cD_zero))
+        # U channel PSNR
+        u_pred_norm = pred[:, 1].cpu()
+        u_pred = u_pred_norm * (u_std + 1e-8) + u_mean
+        u_true = torch.FloatTensor(ll_coeffs_yuv[:, :, 1].flatten())
+        u_psnr = util.get_clamped_psnr(u_true, u_pred)
         
-        # Inverse DWT
-        channel_recon = pywt.waverec2(coeffs_modified, wavelet=WAVELET)
-        channel_recon = np.clip(channel_recon, 0, 255)
-        
-        return channel_recon
+        # V channel PSNR
+        v_pred_norm = pred[:, 2].cpu()
+        v_pred = v_pred_norm * (v_std + 1e-8) + v_mean
+        v_true = torch.FloatTensor(ll_coeffs_yuv[:, :, 2].flatten())
+        v_psnr = util.get_clamped_psnr(v_true, v_pred)
+    
+    print(f"  Final: Y={y_psnr:.2f} dB, U={u_psnr:.2f} dB, V={v_psnr:.2f} dB")
+    
+    # Store normalization params
+    metrics = {
+        'y_mean': float(y_mean),
+        'y_std': float(y_std),
+        'u_mean': float(u_mean),
+        'u_std': float(u_std),
+        'v_mean': float(v_mean),
+        'v_std': float(v_std),
+        'y_psnr': float(y_psnr),
+        'u_psnr': float(u_psnr),
+        'v_psnr': float(v_psnr),
+        'shape': (h, w),
+        'num_pixels': num_pixels
+    }
+    
+    return model_ll, metrics
 
-def calculate_model_size(channel_data, channel_name):
-    """Calculate total model size for a channel"""
-    model_size_ll = util.model_size_in_bits(channel_data['func_rep_ll']) / 8000.
-    print(f'\n{channel_name} LL Model: {model_size_ll:.1f}kB')
+def train_hf_band(hf_coeffs_yuv, band_name, dwt_level, device):
+    """Train a single HF model with 3 outputs (Y, U, V)
     
-    total_size = model_size_ll
+    Uses Y channel to determine sparse positions, then trains all 3 channels
+    at those same positions.
     
-    if USE_SPARSE_HF and channel_data['band_models']:
-        total_hf = 0
-        for level_idx, level_models in enumerate(channel_data['band_models']):
-            for band_name, band_info in level_models.items():
-                band_size = util.model_size_in_bits(band_info['model']) / 8000.
-                total_hf += band_size
-        print(f'{channel_name} HF Models: {total_hf:.1f}kB')
-        total_size += total_hf
+    Args:
+        hf_coeffs_yuv: (H, W, 3) array with Y, U, V channels
+        band_name: 'cH', 'cV', or 'cD'
+        dwt_level: DWT decomposition level
+        device: torch device
     
-    print(f'{channel_name} Total: {total_size:.1f}kB')
-    return total_size
+    Returns:
+        Trained model, metrics dict
+    """
+    h, w, _ = hf_coeffs_yuv.shape
+    
+    # Use Y channel for sparse selection
+    y_channel = hf_coeffs_yuv[:, :, 0]
+    threshold = THRESHOLD_FACTOR * np.std(y_channel)
+    sparse_mask = np.abs(y_channel) > threshold
+    
+    # Extract sparse positions from all 3 channels
+    sparse_coords = np.argwhere(sparse_mask)
+    num_coeffs = len(sparse_coords)
+    
+    if num_coeffs == 0:
+        print(f"  {band_name}: No coefficients above threshold, skipping")
+        return None, None
+    
+    # Normalize all 3 channels
+    y_vals = y_channel[sparse_mask]
+    u_vals = hf_coeffs_yuv[:, :, 1][sparse_mask]
+    v_vals = hf_coeffs_yuv[:, :, 2][sparse_mask]
+    
+    y_mean, y_std = np.mean(y_vals), np.std(y_vals)
+    u_mean, u_std = np.mean(u_vals), np.std(u_vals)
+    v_mean, v_std = np.mean(v_vals), np.std(v_vals)
+    
+    y_norm = (y_vals - y_mean) / (y_std + 1e-8)
+    u_norm = (u_vals - u_mean) / (u_std + 1e-8)
+    v_norm = (v_vals - v_mean) / (v_std + 1e-8)
+    
+    # Create coordinate tensors
+    coords_norm = sparse_coords.astype(np.float32)
+    coords_norm[:, 0] = (coords_norm[:, 0] / (h - 1)) * 2 - 1
+    coords_norm[:, 1] = (coords_norm[:, 1] / (w - 1)) * 2 - 1
+    coords_tensor = torch.FloatTensor(coords_norm).to(device)
+    
+    # Stack coefficients (N, 3)
+    coeffs_tensor = torch.stack([
+        torch.FloatTensor(y_norm),
+        torch.FloatTensor(u_norm),
+        torch.FloatTensor(v_norm)
+    ], dim=1).to(device)
+    
+    # Get model architecture and learning rate
+    layers, hidden_size = get_model_size(None, hf_coeffs_yuv, band_name)
+    hf_lr, _ = get_adaptive_hf_lr(hf_coeffs_yuv, band_name, dwt_level)
+    
+    # Adaptive iterations
+    if num_coeffs < 1000:
+        iterations = 3000
+    elif num_coeffs < 5000:
+        iterations = 2000
+    else:
+        iterations = 1500
+    
+    sparsity_pct = 100.0 * num_coeffs / (h * w)
+    
+    print(f"\n{'='*60}")
+    print(f"Training {band_name} band (YUV) - Level {dwt_level}")
+    print(f"  Shape: {h}x{w}, Sparse: {num_coeffs}/{h*w} ({sparsity_pct:.2f}%)")
+    print(f"  Y: mean={y_mean:.3f}, std={y_std:.3f}")
+    print(f"  U: mean={u_mean:.3f}, std={u_std:.3f}")
+    print(f"  V: mean={v_mean:.3f}, std={v_std:.3f}")
+    print(f"  Model: {layers} layers x {hidden_size} units")
+    print(f"  LR: {hf_lr:.2e}, Iterations: {iterations}")
+    print(f"{'='*60}")
+    
+    # Create model with 3 outputs
+    model_hf = Siren(
+        dim_in=2,
+        dim_hidden=hidden_size,
+        dim_out=3,  # Y, U, V channels
+        num_layers=layers,
+        final_activation=None,
+        w0_initial=30.0,
+        w0=30.0
+    ).to(device)
+    
+    # Train
+    trainer = Trainer(model_hf, lr=hf_lr)
+    trainer.train(coords_tensor, coeffs_tensor, num_iters=iterations)
+    
+    # Calculate final metrics per channel
+    with torch.no_grad():
+        pred = model_hf(coords_tensor)
+        
+        # Y channel
+        y_pred_norm = pred[:, 0].cpu()
+        y_pred = y_pred_norm * (y_std + 1e-8) + y_mean
+        y_true = torch.FloatTensor(y_vals)
+        y_mse = torch.mean((y_pred - y_true) ** 2).item()
+        y_mae = torch.mean(torch.abs(y_pred - y_true)).item()
+        y_psnr = util.get_clamped_psnr(y_true, y_pred)
+        
+        # U channel
+        u_pred_norm = pred[:, 1].cpu()
+        u_pred = u_pred_norm * (u_std + 1e-8) + u_mean
+        u_true = torch.FloatTensor(u_vals)
+        u_mse = torch.mean((u_pred - u_true) ** 2).item()
+        u_mae = torch.mean(torch.abs(u_pred - u_true)).item()
+        u_psnr = util.get_clamped_psnr(u_true, u_pred)
+        
+        # V channel
+        v_pred_norm = pred[:, 2].cpu()
+        v_pred = v_pred_norm * (v_std + 1e-8) + v_mean
+        v_true = torch.FloatTensor(v_vals)
+        v_mse = torch.mean((v_pred - v_true) ** 2).item()
+        v_mae = torch.mean(torch.abs(v_pred - v_true)).item()
+        v_psnr = util.get_clamped_psnr(v_true, v_pred)
+    
+    print(f"  Final Y: PSNR={y_psnr:.2f} dB, MSE={y_mse:.2f}, MAE={y_mae:.2f}")
+    print(f"  Final U: PSNR={u_psnr:.2f} dB, MSE={u_mse:.2f}, MAE={u_mae:.2f}")
+    print(f"  Final V: PSNR={v_psnr:.2f} dB, MSE={v_mse:.2f}, MAE={v_mae:.2f}")
+    
+    # Store metrics
+    metrics = {
+        'y_mean': float(y_mean),
+        'y_std': float(y_std),
+        'u_mean': float(u_mean),
+        'u_std': float(u_std),
+        'v_mean': float(v_mean),
+        'v_std': float(v_std),
+        'y_psnr': float(y_psnr),
+        'u_psnr': float(u_psnr),
+        'v_psnr': float(v_psnr),
+        'y_mse': float(y_mse),
+        'u_mse': float(u_mse),
+        'v_mse': float(v_mse),
+        'y_mae': float(y_mae),
+        'u_mae': float(u_mae),
+        'v_mae': float(v_mae),
+        'shape': (h, w),
+        'num_coeffs': num_coeffs,
+        'sparse_mask': sparse_mask,
+        'threshold': float(threshold)
+    }
+    
+    return model_hf, metrics
+
+def reconstruct_progressive_image_multilevel(coeffs_yuv_list, metrics_all, device, output_prefix, img_shape):
+    """Reconstruct image progressively for multi-level DWT
+    
+    Progressive stages go level by level, adding bands within each level
+    """
+    ll_yuv = coeffs_yuv_list[0]
+    hf_bands_per_level = coeffs_yuv_list[1:]
+    
+    # Load original RGB
+    img_rgb = Image.open(f"kodak-dataset/{IMAGEID}.png")
+    img_rgb_array = np.array(img_rgb)
+    h, w = img_shape
+    
+    progressive_results = []
+    
+    # Helper to reconstruct with specified bands
+    def recon_bands(bands_dict, stage_name):
+        # LL
+        model_ll = metrics_all['ll']['model'].half()
+        h_ll, w_ll, _ = ll_yuv.shape
+        yy, xx = np.meshgrid(np.linspace(-1, 1, h_ll), np.linspace(-1, 1, w_ll), indexing='ij')
+        coords_ll = torch.FloatTensor(np.stack([yy.flatten(), xx.flatten()], axis=1)).to(device).half()
+        
+        with torch.no_grad():
+            pred_ll = model_ll(coords_ll).cpu().float().numpy()
+        
+        ll_recon = np.stack([
+            (pred_ll[:, 0] * (metrics_all['ll']['y_std'] + 1e-8) + metrics_all['ll']['y_mean']).reshape(h_ll, w_ll),
+            (pred_ll[:, 1] * (metrics_all['ll']['u_std'] + 1e-8) + metrics_all['ll']['u_mean']).reshape(h_ll, w_ll),
+            (pred_ll[:, 2] * (metrics_all['ll']['v_std'] + 1e-8) + metrics_all['ll']['v_mean']).reshape(h_ll, w_ll)
+        ], axis=2)
+        
+        # HF
+        hf_recon_per_level = []
+        total_size_kb = sum(p.numel() * 2 for p in metrics_all['ll']['model'].parameters()) / 1024
+        
+        for level_idx, (cH_orig, cV_orig, cD_orig) in enumerate(hf_bands_per_level, 1):
+            level_hf = {}
+            enabled_bands = bands_dict.get(level_idx, [])
+            
+            for band_name, band_orig in [('cH', cH_orig), ('cV', cV_orig), ('cD', cD_orig)]:
+                key = f'level{level_idx}_{band_name}'
+                if band_name in enabled_bands and key in metrics_all and metrics_all[key]['model'] is not None:
+                    model_hf = metrics_all[key]['model'].half()
+                    metrics_hf = metrics_all[key]
+                    sparse_mask = metrics_hf['sparse_mask']
+                    h_hf, w_hf = sparse_mask.shape
+                    
+                    sparse_coords = np.argwhere(sparse_mask).astype(np.float32)
+                    sparse_coords[:, 0] = (sparse_coords[:, 0] / (h_hf - 1)) * 2 - 1
+                    sparse_coords[:, 1] = (sparse_coords[:, 1] / (w_hf - 1)) * 2 - 1
+                    coords_hf = torch.FloatTensor(sparse_coords).to(device).half()
+                    
+                    with torch.no_grad():
+                        pred_hf = model_hf(coords_hf).cpu().float().numpy()
+                    
+                    band_recon = np.zeros((h_hf, w_hf, 3))
+                    for c, (pred_c, mean, std) in enumerate([(pred_hf[:, 0], metrics_hf['y_mean'], metrics_hf['y_std']),
+                                                               (pred_hf[:, 1], metrics_hf['u_mean'], metrics_hf['u_std']),
+                                                               (pred_hf[:, 2], metrics_hf['v_mean'], metrics_hf['v_std'])]):
+                        vals = pred_c * (std + 1e-8) + mean
+                        band_recon[sparse_mask, c] = vals
+                    
+                    level_hf[band_name] = band_recon
+                    total_size_kb += sum(p.numel() * 2 for p in metrics_all[key]['model'].parameters()) / 1024
+                else:
+                    level_hf[band_name] = np.zeros_like(band_orig)
+            
+            hf_recon_per_level.append((level_hf['cH'], level_hf['cV'], level_hf['cD']))
+        
+        # waverec2
+        coeffs_list = [ll_recon] + hf_recon_per_level
+        img_yuv_recon = np.zeros((h, w, 3))
+        for c in range(3):
+            coeffs_c = [coeffs_list[0][:, :, c]] + [(lb[0][:, :, c], lb[1][:, :, c], lb[2][:, :, c]) for lb in coeffs_list[1:]]
+            img_yuv_recon[:, :, c] = pywt.waverec2(coeffs_c, WAVELET)
+        
+        img_rgb_recon = yuv_to_rgb(img_yuv_recon)
+        psnr = util.get_clamped_psnr(torch.FloatTensor(img_rgb_array.flatten()), torch.FloatTensor(img_rgb_recon.flatten()))
+        
+        suffix = stage_name.lower().replace('+', '_').replace(':', '_').replace(' ', '_')
+        Image.fromarray(img_rgb_recon).save(f"{output_prefix}_progressive_{suffix}.png")
+        print(f"Progressive: {psnr:.2f} dB, {total_size_kb:.1f} kB → {output_prefix}_progressive_{suffix}.png")
+        progressive_results.append((stage_name, psnr, total_size_kb))
+    
+    # LL only
+    recon_bands({}, "LL")
+    
+    # Progressive: level by level, band by band
+    num_levels = len(hf_bands_per_level)
+    for level_idx in range(1, num_levels + 1):
+        bands_dict = {prev: ['cH', 'cV', 'cD'] for prev in range(1, level_idx)}
+        
+        for bands in [['cH'], ['cH', 'cV'], ['cH', 'cV', 'cD']]:
+            key = f'level{level_idx}_{bands[-1]}'
+            if key in metrics_all and metrics_all[key]['model'] is not None:
+                bands_dict[level_idx] = bands
+                band_str = '+'.join(bands)
+                recon_bands(bands_dict.copy(), f"LL+...+L{level_idx}:{band_str}")
+    
+    return progressive_results
+    
+    return progressive_results
+
 
 def main():
     start_time = time.time()
     
-    # Load image and convert to YCbCr
+    # Load RGB image
     img_rgb = Image.open(f"kodak-dataset/{IMAGEID}.png")
-    img_ycbcr = img_rgb.convert("YCbCr")
-    y_channel, u_channel, v_channel = img_ycbcr.split()
+    img_rgb_array = np.array(img_rgb)
     
-    # Convert to numpy arrays
-    Y = np.asarray(y_channel, dtype=np.float32)
-    U_full = np.asarray(u_channel, dtype=np.float32)
-    V_full = np.asarray(v_channel, dtype=np.float32)
+    print(f"Original RGB image: {img_rgb_array.shape}")
     
-    # Apply 4:2:0 chroma subsampling if enabled
-    if USE_CHROMA_SUBSAMPLING:
-        # Downsample U and V channels
-        u_img = Image.fromarray(U_full.astype(np.uint8))
-        v_img = Image.fromarray(V_full.astype(np.uint8))
-        
-        new_size = (u_img.width // CHROMA_SUBSAMPLE_FACTOR, u_img.height // CHROMA_SUBSAMPLE_FACTOR)
-        u_downsampled = u_img.resize(new_size, Image.Resampling.LANCZOS)
-        v_downsampled = v_img.resize(new_size, Image.Resampling.LANCZOS)
-        
-        U = np.asarray(u_downsampled, dtype=np.float32)
-        V = np.asarray(v_downsampled, dtype=np.float32)
-        
-        print(f"Original image shape: {Y.shape}")
-        print(f"4:2:0 Chroma subsampling applied:")
-        print(f"  Y channel: {Y.shape}")
-        print(f"  U channel: {U.shape} (downsampled from {U_full.shape})")
-        print(f"  V channel: {V.shape} (downsampled from {V_full.shape})")
-    else:
-        U = U_full
-        V = V_full
-        print(f"Original image shape: {Y.shape}")
-        print(f"No chroma subsampling (4:4:4)")
+    # Convert RGB to YUV
+    img_yuv = rgb_to_yuv(img_rgb)
+    print(f"YUV image: {img_yuv.shape}")
     
-    original_size_bytes = Y.nbytes + U.nbytes + V.nbytes
+    # Apply multi-level DWT to each YUV channel
+    coeffs_y = pywt.wavedec2(img_yuv[:, :, 0], WAVELET, level=LEVELS)
+    coeffs_u = pywt.wavedec2(img_yuv[:, :, 1], WAVELET, level=LEVELS)
+    coeffs_v = pywt.wavedec2(img_yuv[:, :, 2], WAVELET, level=LEVELS)
+    
+    # Reorganize to multi-level format: [LL, (cH1,cV1,cD1), (cH2,cV2,cD2), ...]
+    # Each band has shape (H, W, 3) for Y, U, V channels
+    ll_yuv = np.stack([coeffs_y[0], coeffs_u[0], coeffs_v[0]], axis=2)
+    
+    # Store HF bands per level
+    hf_bands_per_level = []
+    for level_idx in range(1, len(coeffs_y)):
+        cH_yuv = np.stack([coeffs_y[level_idx][0], coeffs_u[level_idx][0], coeffs_v[level_idx][0]], axis=2)
+        cV_yuv = np.stack([coeffs_y[level_idx][1], coeffs_u[level_idx][1], coeffs_v[level_idx][1]], axis=2)
+        cD_yuv = np.stack([coeffs_y[level_idx][2], coeffs_u[level_idx][2], coeffs_v[level_idx][2]], axis=2)
+        hf_bands_per_level.append((cH_yuv, cV_yuv, cD_yuv))
+    
+    coeffs_yuv_combined = [ll_yuv] + hf_bands_per_level
+    
+    print(f"LL shape: {ll_yuv.shape}")
+    for level_idx, (cH, cV, cD) in enumerate(hf_bands_per_level, 1):
+        print(f"Level {level_idx}: cH={cH.shape}, cV={cV.shape}, cD={cD.shape}")
+    
+    #Calculate original size
+    h, w = img_rgb_array.shape[:2]
+    original_size_bytes = h * w * 3  # RGB, 8 bits per channel
     original_size_kb = original_size_bytes / 1024
-    original_bpp = (original_size_bytes * 8) / (Y.shape[0] * Y.shape[1])
-    print(f"Original size: {original_size_kb:.2f} kB ({original_bpp:.2f} bpp)")
+    print(f"Original size: {original_size_kb:.2f} kB")
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
     # Set random seed
-    torch.set_default_tensor_type('torch.cuda.FloatTensor' if torch.cuda.is_available() else 'torch.FloatTensor')
     seed = random.randint(1, int(1e6))
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     
     # Create output directory
     os.makedirs(LOG_DIR, exist_ok=True)
     
-    # Process each channel
-    y_data = process_channel_dwt(Y, "Y", MODEL_SIZE_SCALE_Y_LL, MODEL_SIZE_SCALE_Y_HF, is_chroma=False)
-    u_data = process_channel_dwt(U, "U", MODEL_SIZE_SCALE_UV_LL, MODEL_SIZE_SCALE_UV_HF, is_chroma=True)
-    v_data = process_channel_dwt(V, "V", MODEL_SIZE_SCALE_UV_LL, MODEL_SIZE_SCALE_UV_HF, is_chroma=True)
+    # Train LL band
+    model_ll, metrics_ll = train_ll_band(ll_yuv, device)
     
-    # Train all models
-    train_channel_models(y_data, "Y")
-    train_channel_models(u_data, "U")
-    train_channel_models(v_data, "V")
+    # Collect all metrics and models
+    metrics_all = {'ll': {**metrics_ll, 'model': model_ll}}
     
-    # Calculate total model size
-    print("\n" + "="*60)
-    print("MODEL SIZES")
-    print("="*60)
-    y_size = calculate_model_size(y_data, "Y")
-    u_size = calculate_model_size(u_data, "U")
-    v_size = calculate_model_size(v_data, "V")
-    
-    total_model_size = y_size + u_size + v_size
-    print(f"\nTotal Model Size (FP32): {total_model_size:.1f}kB")
-    print(f"Total Model Size (FP16): {total_model_size/2:.1f}kB")
-    
-    # Reconstruct channels
-    print("\n" + "="*60)
-    print("RECONSTRUCTION")
-    print("="*60)
-    
-    Y_recon = reconstruct_channel(y_data, "Y")
-    U_recon = reconstruct_channel(u_data, "U")
-    V_recon = reconstruct_channel(v_data, "V")
-    
-    # Upsample U and V if 4:2:0 was used
-    if USE_CHROMA_SUBSAMPLING:
-        # Upsample U and V back to Y resolution
-        target_size = (Y_recon.shape[1], Y_recon.shape[0])  # (width, height)
+    # Train HF bands for each level
+    for level_idx, (cH_yuv, cV_yuv, cD_yuv) in enumerate(hf_bands_per_level, 1):
+        print(f"\n{'='*60}")
+        print(f"Processing Level {level_idx}")
+        print(f"{'='*60}")
         
-        u_img_small = Image.fromarray(U_recon.astype(np.uint8))
-        v_img_small = Image.fromarray(V_recon.astype(np.uint8))
+        model_ch, metrics_ch = train_hf_band(cH_yuv, 'cH', dwt_level=level_idx, device=device)
+        model_cv, metrics_cv = train_hf_band(cV_yuv, 'cV', dwt_level=level_idx, device=device)
+        model_cd, metrics_cd = train_hf_band(cD_yuv, 'cD', dwt_level=level_idx, device=device)
         
-        u_img_upsampled = u_img_small.resize(target_size, Image.Resampling.LANCZOS)
-        v_img_upsampled = v_img_small.resize(target_size, Image.Resampling.LANCZOS)
+        # Store with level-specific keys
+        metrics_all[f'level{level_idx}_cH'] = {**metrics_ch, 'model': model_ch} if metrics_ch is not None else {'model': None}
+        metrics_all[f'level{level_idx}_cV'] = {**metrics_cv, 'model': model_cv} if metrics_cv is not None else {'model': None}
+        metrics_all[f'level{level_idx}_cD'] = {**metrics_cd, 'model': model_cd} if metrics_cd is not None else {'model': None}
+    
+    # Progressive reconstruction
+    output_prefix = f"{LOG_DIR}/{IMAGEID}"
+    progressive_results = reconstruct_progressive_image_multilevel(coeffs_yuv_combined, metrics_all, device, output_prefix, img_rgb_array.shape[:2])
+    
+    # Final reconstruction with all bands (FP16)
+    print(f"\n{'='*60}")
+    print("Final reconstruction (FP16)")
+    print(f"{'='*60}")
+    
+    # Reconstruct LL
+    model_ll_fp16 = model_ll.half()
+    h_ll, w_ll, _ = ll_yuv.shape
+    y_coords = np.linspace(-1, 1, h_ll)
+    x_coords = np.linspace(-1, 1, w_ll)
+    yy, xx = np.meshgrid(y_coords, x_coords, indexing='ij')
+    coords_ll = np.stack([yy.flatten(), xx.flatten()], axis=1)
+    coords_tensor_ll = torch.FloatTensor(coords_ll).to(device).half()
+    
+    with torch.no_grad():
+        pred_ll = model_ll_fp16(coords_tensor_ll).cpu().float().numpy()
+    
+    y_ll = pred_ll[:, 0] * (metrics_ll['y_std'] + 1e-8) + metrics_ll['y_mean']
+    u_ll = pred_ll[:, 1] * (metrics_ll['u_std'] + 1e-8) + metrics_ll['u_mean']
+    v_ll = pred_ll[:, 2] * (metrics_ll['v_std'] + 1e-8) + metrics_ll['v_mean']
+    
+    ll_recon = np.stack([
+        y_ll.reshape(h_ll, w_ll),
+        u_ll.reshape(h_ll, w_ll),
+        v_ll.reshape(h_ll, w_ll)
+    ], axis=2)
+    
+    # Reconstruct HF bands for all levels
+    hf_recon_per_level = []
+    total_size_fp16 = sum(p.numel() * 2 for p in model_ll.parameters())
+    
+    for level_idx in range(1, LEVELS + 1):
+        level_hf = {}
+        for band_name in ['cH', 'cV', 'cD']:
+            key = f'level{level_idx}_{band_name}'
+            if key in metrics_all and metrics_all[key]['model'] is not None:
+                model_hf = metrics_all[key]['model'].half()
+                metrics_hf = metrics_all[key]
+                sparse_mask = metrics_hf['sparse_mask']
+                h_hf, w_hf = sparse_mask.shape
+                
+                sparse_coords = np.argwhere(sparse_mask)
+                coords_norm = sparse_coords.astype(np.float32)
+                coords_norm[:, 0] = (coords_norm[:, 0] / (h_hf - 1)) * 2 - 1
+                coords_norm[:, 1] = (coords_norm[:, 1] / (w_hf - 1)) * 2 - 1
+                coords_tensor_hf = torch.FloatTensor(coords_norm).to(device).half()
+                
+                with torch.no_grad():
+                    pred_hf = model_hf(coords_tensor_hf).cpu().float().numpy()
+                
+                # Denormalize all 3 channels
+                y_pred = pred_hf[:, 0] * (metrics_hf['y_std'] + 1e-8) + metrics_hf['y_mean']
+                u_pred = pred_hf[:, 1] * (metrics_hf['u_std'] + 1e-8) + metrics_hf['u_mean']
+                v_pred = pred_hf[:, 2] * (metrics_hf['v_std'] + 1e-8) + metrics_hf['v_mean']
+                
+                # Reconstruct full band
+                band_recon = np.zeros((h_hf, w_hf, 3))
+                for c, vals in enumerate([y_pred, u_pred, v_pred]):
+                    band_recon[sparse_mask, c] = vals
+                
+                level_hf[band_name] = band_recon
+                total_size_fp16 += sum(p.numel() * 2 for p in metrics_all[key]['model'].parameters())
+            else:
+                # Zero-filled if no model
+                ref_shape = hf_bands_per_level[level_idx - 1][0].shape  # Use cH shape as reference
+                level_hf[band_name] = np.zeros(ref_shape)
         
-        U_recon_full = np.asarray(u_img_upsampled, dtype=np.uint8)
-        V_recon_full = np.asarray(v_img_upsampled, dtype=np.uint8)
-        
-        print(f"Upsampled U/V from {U_recon.shape} to {U_recon_full.shape}")
-    else:
-        # Ensure same dimensions (no subsampling case)
-        min_h = min(Y_recon.shape[0], U_recon.shape[0], V_recon.shape[0])
-        min_w = min(Y_recon.shape[1], U_recon.shape[1], V_recon.shape[1])
-        
-        U_recon_full = U_recon[:min_h, :min_w].astype(np.uint8)
-        V_recon_full = V_recon[:min_h, :min_w].astype(np.uint8)
+        hf_recon_per_level.append((level_hf['cH'], level_hf['cV'], level_hf['cD']))
     
-    Y_recon = Y_recon.astype(np.uint8)
-    if USE_CHROMA_SUBSAMPLING:
-        # Ensure Y matches upsampled UV size
-        min_h = min(Y_recon.shape[0], U_recon_full.shape[0])
-        min_w = min(Y_recon.shape[1], U_recon_full.shape[1])
-        Y_recon = Y_recon[:min_h, :min_w]
-        U_recon_full = U_recon_full[:min_h, :min_w]
-        V_recon_full = V_recon_full[:min_h, :min_w]
+    # Build coefficient list for waverec2: [LL, (cH1,cV1,cD1), (cH2,cV2,cD2), ...]
+    coeffs_recon_list = [ll_recon] + hf_recon_per_level
     
-    # Merge YUV and convert to RGB
-    ycbcr_recon = Image.merge("YCbCr", [
-        Image.fromarray(Y_recon),
-        Image.fromarray(U_recon_full),
-        Image.fromarray(V_recon_full)
-    ])
-    rgb_recon = ycbcr_recon.convert("RGB")
-    rgb_recon.save(OUTPUT_FILE)
+    # Inverse DWT for each channel using waverec2
+    img_yuv_recon = np.zeros((h, w, 3))
+    for c in range(3):
+        # Extract channel c from all bands
+        coeffs_c = [coeffs_recon_list[0][:, :, c]]  # LL
+        for level_bands in coeffs_recon_list[1:]:
+            coeffs_c.append((level_bands[0][:, :, c], level_bands[1][:, :, c], level_bands[2][:, :, c]))
+        recon_c = pywt.waverec2(coeffs_c, WAVELET)
+        # Ensure correct size (crop if needed due to DWT boundary handling)
+        img_yuv_recon[:, :, c] = recon_c[:h, :w]
     
-    # Calculate PSNR
-    original_rgb = np.asarray(img_rgb, dtype=np.float32)
-    recon_rgb = np.asarray(rgb_recon, dtype=np.float32)
-    img_psnr = util.calc_psnr(original_rgb, recon_rgb)
+    print(f"YUV reconstruction shape: {img_yuv_recon.shape}")
+    print(f"YUV range: Y=[{img_yuv_recon[:,:,0].min():.1f}, {img_yuv_recon[:,:,0].max():.1f}], U=[{img_yuv_recon[:,:,1].min():.1f}, {img_yuv_recon[:,:,1].max():.1f}], V=[{img_yuv_recon[:,:,2].min():.1f}, {img_yuv_recon[:,:,2].max():.1f}]")
     
-    # Calculate per-channel PSNR
-    y_psnr = util.calc_psnr(Y, Y_recon)
+    # Convert to RGB
+    img_rgb_recon = yuv_to_rgb(img_yuv_recon)
+    print(f"RGB reconstruction shape: {img_rgb_recon.shape}, dtype: {img_rgb_recon.dtype}")
+    print(f"RGB range: [{img_rgb_recon.min()}, {img_rgb_recon.max()}]")
     
-    if USE_CHROMA_SUBSAMPLING:
-        # For subsampled channels, compare at subsampled resolution
-        u_psnr = util.calc_psnr(U, U_recon.astype(np.float32))
-        v_psnr = util.calc_psnr(V, V_recon.astype(np.float32))
-    else:
-        u_psnr = util.calc_psnr(U, U_recon_full.astype(np.float32))
-        v_psnr = util.calc_psnr(V, V_recon_full.astype(np.float32))
+    # Calculate final PSNR
+    final_psnr = util.get_clamped_psnr(torch.FloatTensor(img_rgb_array.flatten()), torch.FloatTensor(img_rgb_recon.flatten()))
     
-    end_time = time.time()
-    total_time = end_time - start_time
+    # Calculate sizes and compression ratio
+    total_size_kb = total_size_fp16 / 1024
+    compression_ratio = original_size_kb / total_size_kb
     
-    # Print results
-    print("\n" + "="*60)
-    print("RESULTS")
-    print("="*60)
-    if USE_CHROMA_SUBSAMPLING:
-        print(f"Chroma subsampling:  4:2:0 (UV at 1/{CHROMA_SUBSAMPLE_FACTOR}x resolution)")
-    else:
-        print(f"Chroma subsampling:  None (4:4:4)")
-    print(f"Original size:       {original_size_kb:.2f} kB ({original_bpp:.2f} bpp)")
-    print(f"Model size (FP16):   {total_model_size/2:.1f} kB")
-    print(f"Compression ratio:   {original_size_kb/(total_model_size/2):.2f}x")
-    print(f"\nRGB Image PSNR:      {img_psnr:.2f} dB")
-    print(f"Y Channel PSNR:      {y_psnr:.2f} dB")
-    print(f"U Channel PSNR:      {u_psnr:.2f} dB")
-    print(f"V Channel PSNR:      {v_psnr:.2f} dB")
-    print(f"\nTotal time:          {total_time:.2f}s ({total_time/60:.2f} min)")
-    print("="*60)
+    # Save final image
+    Image.fromarray(img_rgb_recon).save(f"{output_prefix}_final.png")
     
-    print(f"\nSaved reconstructed image to: {OUTPUT_FILE}")
+    print(f"\n{'='*60}")
+    print(f"FINAL RESULTS")
+    print(f"{'='*60}")
+    print(f"PSNR: {final_psnr:.2f} dB")
+    print(f"Model size (FP16): {total_size_kb:.1f} kB")
+    print(f"Original size: {original_size_kb:.1f} kB")
+    print(f"Compression ratio: {compression_ratio:.2f}x")
+    print(f"Saved: {output_prefix}_final.png")
+    
+    # Save metrics
+    metrics_json = {
+        'image_id': IMAGEID,
+        'image_shape': (h, w, 3),
+        'wavelet': WAVELET,
+        'levels': LEVELS,
+        'final_psnr': float(final_psnr),
+        'model_size_fp16_kb': float(total_size_kb),
+        'original_size_kb': float(original_size_kb),
+        'compression_ratio': float(compression_ratio),
+        'll': {k: v for k, v in metrics_ll.items() if k != 'model'},
+        'progressive_results': [{'stage': s, 'psnr': p, 'size_kb': sz} for s, p, sz in progressive_results],
+        'training_time_sec': time.time() - start_time
+    }
+    
+    # Add metrics for each level's HF bands
+    for level_idx in range(1, LEVELS + 1):
+        for band_name in ['cH', 'cV', 'cD']:
+            key = f'level{level_idx}_{band_name}'
+            if key in metrics_all and metrics_all[key].get('model') is not None:
+                metrics_json[key] = {k: v for k, v in metrics_all[key].items() if k not in ['model', 'sparse_mask']}
+    
+    with open(f"{LOG_DIR}/metrics.json", 'w') as f:
+        json.dump(metrics_json, f, indent=2)
+    
+    # Save models (FP16)
+    torch.save(model_ll.half().state_dict(), f"{LOG_DIR}/best_model_ll.pt")
+    for level_idx in range(1, LEVELS + 1):
+        for band_name in ['cH', 'cV', 'cD']:
+            key = f'level{level_idx}_{band_name}'
+            if key in metrics_all and metrics_all[key].get('model') is not None:
+                torch.save(metrics_all[key]['model'].half().state_dict(), f"{LOG_DIR}/best_model_level{level_idx}_{band_name}.pt")
+    
+    print(f"\nTotal time: {time.time() - start_time:.2f} seconds")
 
 if __name__ == "__main__":
     main()
