@@ -15,13 +15,13 @@ from training import Trainer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-ld", "--logdir", help="Path to save logs", default="./results/siren_main")
-parser.add_argument("-ni", "--num_iters", help="Number of iterations to train for", type=int, default=50000)
+parser.add_argument("-ni", "--num_iters", help="Number of iterations to train for", type=int, default=4000)
 parser.add_argument("-lr", "--learning_rate", help="Learning rate", type=float, default=2e-4)
 parser.add_argument("-se", "--seed", help="Random seed", type=int, default=random.randint(1, int(1e6)))
 parser.add_argument("-fd", "--full_dataset", help="Whether to use full dataset", action='store_true')
-parser.add_argument("-iid", "--image_id", help="Image ID to train on, if not the full dataset", type=int, default=15)
-parser.add_argument("-lss", "--layer_size", help="Layer sizes as list of ints", type=int, default=28)
-parser.add_argument("-nl", "--num_layers", help="Number of layers", type=int, default=10)
+parser.add_argument("-iid", "--image_id", help="Image ID to train on, if not the full dataset", type=int, default=1)
+parser.add_argument("-lss", "--layer_size", help="Layer sizes as list of ints", type=int, default=56)
+parser.add_argument("-nl", "--num_layers", help="Number of layers", type=int, default=20)
 parser.add_argument("-w0", "--w0", help="w0 parameter for SIREN model.", type=float, default=30.0)
 parser.add_argument("-w0i", "--w0_initial", help="w0 parameter for first layer of SIREN model.", type=float, default=30.0)
 
@@ -72,6 +72,10 @@ for i in range(min_id, max_id + 1):
     coordinates, features = util.to_coordinates_and_features(img)
     coordinates, features = coordinates.to(device, dtype), features.to(device, dtype)
 
+    # Calculate total parameters
+    total_params = sum(p.numel() for p in func_rep.parameters() if p.requires_grad)
+    print(f'Total parameters: {total_params:,}')
+    
     # Calculate model size. Divide by 8000 to go from bits to kB
     model_size = util.model_size_in_bits(func_rep) / 8000.
     print(f'Model size: {model_size:.1f}kB')
@@ -98,7 +102,7 @@ for i in range(min_id, max_id + 1):
         
         # Calculate image-level PSNR for full precision
         fp_img_psnr = util.get_clamped_psnr(img_recon, img)
-        print(f'Full precision image PSNR: {fp_img_psnr:.2f} dB')
+        print(f'Full precision RGB PSNR: {fp_img_psnr:.2f} dB')
         
         save_image(torch.clamp(img_recon, 0, 1).to('cpu'), args.logdir + f'/fp_reconstruction_{i}.png')
 
@@ -118,7 +122,7 @@ for i in range(min_id, max_id + 1):
             img_recon = func_rep(coordinates).reshape(img.shape[1], img.shape[2], 3).permute(2, 0, 1).float()
             hp_psnr = util.get_clamped_psnr(img_recon, img)
             save_image(torch.clamp(img_recon, 0, 1).to('cpu'), args.logdir + f'/hp_reconstruction_{i}.png')
-            print(f'Half precision image PSNR: {hp_psnr:.2f} dB')
+            print(f'Half precision RGB PSNR: {hp_psnr:.2f} dB')
             results['hp_psnr'].append(hp_psnr)
     else:
         results['hp_bpp'].append(fp_bpp)
