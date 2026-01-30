@@ -19,18 +19,18 @@ import util
 LEVELS = 2        # Number of DWT decomposition levels
 WAVELET = "db4"   # Wavelet type
 LOG_DIR = "results/dwt_split_yuv_channels"
-IMAGEID = "kodim01"  # Image to compress
+IMAGEID = "kodim02"  # Image to compress
 
 # Parameter budget from original RGB SIREN (10 layers, 28 hidden, 3 outputs)
 # TOTAL_PARAM_BUDGET = 4346
 TOTAL_PARAM_BUDGET = 60987
 
-ITERA = 4000  # Training iterations per band model
+ITERA = 3000  # Training iterations per band model
 
 # Parameter allocation percentages for YUV channels
-Y_BUDGET_PERCENT = 0.7   # 70% for Y (luminance)
-U_BUDGET_PERCENT = 0.15   # 15% for U (chrominance)
-V_BUDGET_PERCENT = 0.15   # 15% for V (chrominance)
+Y_BUDGET_PERCENT = 0.6   # 70% for Y (luminance)
+U_BUDGET_PERCENT = 0.2   # 15% for U (chrominance)
+V_BUDGET_PERCENT = 0.2   # 15% for V (chrominance)
 
 # HF bands parameter budget (as percentage of total budget)
 # These are PART OF the channel budgets above, not additional
@@ -40,7 +40,7 @@ U_HF_BUDGET_PERCENT = 0.1   # 9% for U channel HF bands (out of U's 15%)
 V_HF_BUDGET_PERCENT = 0.1   # 9% for V channel HF bands (out of V's 15%)
 
 # Threshold for sparsity - higher = fewer HF coeffs = smaller models work better
-THRESHOLD_FACTOR = 2  # Increased from 1.0 to keep only important coefficients
+THRESHOLD_FACTOR = 1.5  # Increased from 1.0 to keep only important coefficients
 
 # Training options
 SKIP_HF_TRAINING = False  # Set to True to only train LL bands (skip all HF bands)
@@ -144,10 +144,9 @@ def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, cha
         # Y channel LL: train ALL pixels
         ll_pixels = ll_coeffs.size
     else:
-        # U/V channel LL: use much lower threshold (chroma has less variation)
-        # Use 0.3 instead of 1.0 to capture more subtle chroma variations
-        threshold = 0.3 * np.std(ll_coeffs)
-        sparse_mask = np.abs(ll_coeffs - np.mean(ll_coeffs)) > threshold
+        # U/V channel LL: use threshold relative to std
+        threshold = THRESHOLD_FACTOR * np.std(ll_coeffs)
+        sparse_mask = np.abs(ll_coeffs) > threshold
         ll_pixels = np.sum(sparse_mask)
     
     if ll_pixels > 0:

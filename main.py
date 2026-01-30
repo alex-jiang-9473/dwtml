@@ -15,11 +15,11 @@ from training import Trainer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-ld", "--logdir", help="Path to save logs", default="./results/siren_main")
-parser.add_argument("-ni", "--num_iters", help="Number of iterations to train for", type=int, default=4000)
+parser.add_argument("-ni", "--num_iters", help="Number of iterations to train for", type=int, default=2000)
 parser.add_argument("-lr", "--learning_rate", help="Learning rate", type=float, default=2e-4)
 parser.add_argument("-se", "--seed", help="Random seed", type=int, default=random.randint(1, int(1e6)))
 parser.add_argument("-fd", "--full_dataset", help="Whether to use full dataset", action='store_true')
-parser.add_argument("-iid", "--image_id", help="Image ID to train on, if not the full dataset", type=int, default=1)
+parser.add_argument("-iid", "--image_id", help="Image ID to train on, if not the full dataset", type=int, default=2)
 parser.add_argument("-lss", "--layer_size", help="Layer sizes as list of ints", type=int, default=56)
 parser.add_argument("-nl", "--num_layers", help="Number of layers", type=int, default=20)
 parser.add_argument("-w0", "--w0", help="w0 parameter for SIREN model.", type=float, default=30.0)
