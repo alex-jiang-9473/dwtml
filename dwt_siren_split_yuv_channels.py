@@ -19,7 +19,7 @@ import util
 LEVELS = 2        # Number of DWT decomposition levels
 WAVELET = "db4"   # Wavelet type
 LOG_DIR = "results/dwt_split_yuv_channels"
-IMAGEID = "kodim02"  # Image to compress
+IMAGEID = "kodim01"  # Image to compress
 
 # Parameter budget from original RGB SIREN (10 layers, 28 hidden, 3 outputs)
 # TOTAL_PARAM_BUDGET = 4346
@@ -120,6 +120,30 @@ def find_model_size_for_budget(target_params, dim_in=2, dim_out=1):
             break
     
     return best_config
+
+def calculate_iterations_for_params(params, base_iterations=ITERA, reference_params=10000):
+    """Calculate training iterations based on parameter count
+    
+    Larger models get more iterations, smaller models get fewer.
+    Uses square root scaling to balance training time vs quality.
+    
+    Args:
+        params: Number of parameters in the model
+        base_iterations: Base iteration count (from ITERA config)
+        reference_params: Reference parameter count for base_iterations
+    
+    Returns:
+        Number of iterations (minimum 500, maximum 2x base_iterations)
+    """
+    # Square root scaling: larger models don't need proportionally more iterations
+    scale = np.sqrt(params / reference_params)
+    iterations = int(base_iterations * scale)
+    
+    # Clamp to reasonable range
+    min_iters = 500
+    max_iters = base_iterations * 2
+    
+    return max(min_iters, min(iterations, max_iters))
 
 def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, channel_name):
     """Allocate parameter budget across DWT bands for a single channel
@@ -435,7 +459,7 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
         #     iterations = 7000
         # else:
         #     iterations = 8000
-        iterations = ITERA
+        iterations = calculate_iterations_for_params(ll_config['params'])
         print(f"Training LL band: {h}x{w} all pixels, {iterations} iterations")
     else:
         # U/V channel LL: use thresholding
@@ -454,14 +478,8 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
         
         coeffs_to_train = ll_coeffs[sparse_mask]
         
-        # More iterations for sparse LL
-        # if num_train < 1000:
-        #     iterations = 4000
-        # elif num_train < 5000:
-        #     iterations = 3000
-        # else:
-        #     iterations = 2500
-        iterations = ITERA
+        # Adaptive iterations based on model size
+        iterations = calculate_iterations_for_params(ll_config['params'])
         sparsity_pct = 100.0 * num_train / (h * w)
         print(f"Training LL band: {num_train}/{h*w} coeffs ({sparsity_pct:.1f}%), {iterations} iterations")
     
@@ -536,7 +554,7 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
             
             config = allocations[band_full_name]
             
-            iterations = ITERA
+            iterations = calculate_iterations_for_params(config['params'])
             
             print(f"Training {band_full_name} (combined cH,cV,cD): {num_coeffs}/{h*w} coeffs, {iterations} iterations")
             model_hf, hf_mean, hf_std, hf_psnr = train_single_band_model(
@@ -596,7 +614,7 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
             
             config = allocations[band_full_name]
             
-            iterations = ITERA
+            iterations = calculate_iterations_for_params(config['params'])
             
             print(f"Training {band_full_name}: {num_coeffs}/{h*w} coeffs, {iterations} iterations")
             # Use standard w0=30.0 - too high causes saturation
@@ -686,14 +704,8 @@ def train_combined_uv_dwt_models(u_channel, v_channel, u_coeffs, v_coeffs, param
         ll_v[sparse_mask]
     ], axis=1)
     
-    # Adaptive iterations
-    # if num_train < 1000:
-    #     iterations = 4000
-    # elif num_train < 5000:
-    #     iterations = 3000
-    # else:
-    #     iterations = 2500
-    iterations = ITERA
+    # Adaptive iterations based on model size
+    iterations = calculate_iterations_for_params(ll_config['params'])
     
     sparsity_pct = 100.0 * num_train / (h * w)
     print(f"Training UV LL band (2 outputs): {num_train}/{h*w} coeffs ({sparsity_pct:.1f}%), {iterations} iterations")
