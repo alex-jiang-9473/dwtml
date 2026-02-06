@@ -448,8 +448,8 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
     
     models = {}
     
-    # Train LL band (if not training only specific HF level)
-    if train_only_level is None:
+    # Train LL band (if not training only specific HF level or if training only LL)
+    if train_only_level is None and (train_only_band is None or train_only_band == 'LL'):
         ll_coeffs = channel_coeffs[0]
         h, w = ll_coeffs.shape
         
@@ -524,7 +524,7 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
         print(f"  ✓ LL: PSNR={ll_psnr:.2f} dB, params={ll_config['params']:,}")
         
         # Return early if only training LL band
-        if train_only_ll:
+        if train_only_ll or train_only_band == 'LL':
             return models
     
     # Train HF bands
@@ -539,11 +539,15 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
     if USE_COMBINED_HF:
         # Train combined HF bands (one 3-output model per level)
         for level_idx, (cH, cV, cD) in enumerate(channel_coeffs[1:], start=1):
-            # Skip if only training specific level
+            # Skip if only training specific level or band
             if train_only_level is not None and level_idx != train_only_level:
                 continue
                 
             band_full_name = f"HF_L{level_idx}"
+            
+            # Skip if training only specific band and this isn't it
+            if train_only_band is not None and train_only_band != band_full_name:
+                continue
             
             if band_full_name not in allocations:
                 continue
@@ -619,6 +623,10 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
             
         for band_name, coeffs in [('cH', cH), ('cV', cV), ('cD', cD)]:
             band_full_name = f"{band_name}_L{level_idx}"
+            
+            # Skip if training only specific band and this isn't it
+            if train_only_band is not None and train_only_band != band_full_name:
+                continue
             
             # Skip if not in allocations (no sparse coefficients)
             if band_full_name not in allocations:
@@ -952,7 +960,7 @@ def main():
     print(f"  U Channel: {int(TOTAL_PARAM_BUDGET * U_BUDGET_PERCENT):,} ({100*U_BUDGET_PERCENT:.1f}%) = LL {u_budget:,} ({u_ll_percent:.1f}%) + HF {u_hf_budget:,} ({100*U_HF_BUDGET_PERCENT:.1f}%)")
     print(f"  V Channel: {int(TOTAL_PARAM_BUDGET * V_BUDGET_PERCENT):,} ({100*V_BUDGET_PERCENT:.1f}%) = LL {v_budget:,} ({v_ll_percent:.1f}%) + HF {v_hf_budget:,} ({100*V_HF_BUDGET_PERCENT:.1f}%)")
     
-    # Train models for each channel separately with progressive reconstruction
+    # Train models for each band individually with PSNR after each
     start_time = time.time()
     orig_h, orig_w = y_channel.shape
     
@@ -961,9 +969,9 @@ def main():
     u_models = {}
     v_models = {}
     
-    # Helper function to reconstruct and calc PSNR after each stage
-    final_psnrs = {}  # Track final PSNRs for results saving
-    def reconstruct_and_calc_psnr(stage_name, save_image=False):
+    # Helper function to reconstruct and calc PSNR after each band
+    band_psnrs = []  # Track PSNR after each band
+    def reconstruct_and_calc_psnr(band_desc):
         # Reconstruct channels
         y_rec_coeffs = reconstruct_channel_from_models(y_models, y_coeffs, device) if y_models else None
         u_rec_coeffs = reconstruct_channel_from_models(u_models, u_coeffs, device) if u_models else None
@@ -987,57 +995,64 @@ def main():
         v_psnr = util.get_clamped_psnr(torch.FloatTensor(v_channel.flatten()), torch.FloatTensor(v_rec.flatten()))
         rgb_psnr = util.get_clamped_psnr(torch.FloatTensor(np.array(img_rgb).flatten()), torch.FloatTensor(rgb_rec.flatten()))
         
-        print(f"\n{'='*70}")
-        print(f"{stage_name} - PSNR:")
-        print(f"  Y: {y_psnr:.2f} dB, U: {u_psnr:.2f} dB, V: {v_psnr:.2f} dB, RGB: {rgb_psnr:.2f} dB")
-        print(f"{'='*70}")
+        print(f"  → After {band_desc}: Y={y_psnr:.2f}, U={u_psnr:.2f}, V={v_psnr:.2f}, RGB={rgb_psnr:.2f} dB")
         
-        # Save image if requested
-        if save_image:
-            img_path = os.path.join(LOG_DIR, f"{IMAGEID}_{stage_name.lower().replace(' ', '_')}.png")
-            Image.fromarray(rgb_rec, mode='RGB').save(img_path)
-            print(f"Saved: {img_path}")
-        
-        # Store final PSNRs
-        final_psnrs[stage_name] = {'y': float(y_psnr), 'u': float(u_psnr), 'v': float(v_psnr), 'rgb': float(rgb_psnr)}
+        # Store PSNR
+        band_psnrs.append({
+            'band': band_desc,
+            'y': float(y_psnr),
+            'u': float(u_psnr),
+            'v': float(v_psnr),
+            'rgb': float(rgb_psnr)
+        })
         
         return y_psnr, u_psnr, v_psnr, rgb_psnr
     
-    # Stage 1: Train all LL bands
-    print(f"\n{'='*70}")
-    print(f"STAGE 1: Training LL Bands (Y, U, V)")
-    print(f"{'='*70}")
-    y_models_temp = train_channel_dwt_models(y_channel, y_coeffs, 'Y', y_budget, y_hf_budget, device, train_only_ll=True)
-    y_models.update(y_models_temp)
-    u_models_temp = train_channel_dwt_models(u_channel, u_coeffs, 'U', u_budget, u_hf_budget, device, train_only_ll=True)
-    u_models.update(u_models_temp)
-    v_models_temp = train_channel_dwt_models(v_channel, v_coeffs, 'V', v_budget, v_hf_budget, device, train_only_ll=True)
-    v_models.update(v_models_temp)
-    reconstruct_and_calc_psnr("After LL Training", save_image=True)
+    # Define all 21 bands in training order
+    # Format: (channel_name, channel, coeffs, budget, hf_budget, band_name)
+    all_bands = [
+        # LL bands (3 bands)
+        ('Y', y_channel, y_coeffs, y_budget, y_hf_budget, 'LL'),
+        ('U', u_channel, u_coeffs, u_budget, u_hf_budget, 'LL'),
+        ('V', v_channel, v_coeffs, v_budget, v_hf_budget, 'LL'),
+    ]
     
-    # Stage 2: Train all Level 1 HF bands
-    print(f"\n{'='*70}")
-    print(f"STAGE 2: Training Level 1 HF Bands (Y, U, V)")
-    print(f"{'='*70}")
-    y_models_temp = train_channel_dwt_models(y_channel, y_coeffs, 'Y', y_budget, y_hf_budget, device, train_only_level=1)
-    y_models.update(y_models_temp)
-    u_models_temp = train_channel_dwt_models(u_channel, u_coeffs, 'U', u_budget, u_hf_budget, device, train_only_level=1)
-    u_models.update(u_models_temp)
-    v_models_temp = train_channel_dwt_models(v_channel, v_coeffs, 'V', v_budget, v_hf_budget, device, train_only_level=1)
-    v_models.update(v_models_temp)
-    reconstruct_and_calc_psnr("After Level 1 Training", save_image=True)
+    # Level 1 HF bands (9 bands: 3 channels × 3 HF types)
+    for band_type in ['cH_L1', 'cV_L1', 'cD_L1']:
+        all_bands.append(('Y', y_channel, y_coeffs, y_budget, y_hf_budget, band_type))
+        all_bands.append(('U', u_channel, u_coeffs, u_budget, u_hf_budget, band_type))
+        all_bands.append(('V', v_channel, v_coeffs, v_budget, v_hf_budget, band_type))
     
-    # Stage 3: Train all Level 2 HF bands
+    # Level 2 HF bands (9 bands: 3 channels × 3 HF types)
+    for band_type in ['cH_L2', 'cV_L2', 'cD_L2']:
+        all_bands.append(('Y', y_channel, y_coeffs, y_budget, y_hf_budget, band_type))
+        all_bands.append(('U', u_channel, u_coeffs, u_budget, u_hf_budget, band_type))
+        all_bands.append(('V', v_channel, v_coeffs, v_budget, v_hf_budget, band_type))
+    
     print(f"\n{'='*70}")
-    print(f"STAGE 3: Training Level 2 HF Bands (Y, U, V)")
+    print(f"Training All 21 Sub-bands Individually")
     print(f"{'='*70}")
-    y_models_temp = train_channel_dwt_models(y_channel, y_coeffs, 'Y', y_budget, y_hf_budget, device, train_only_level=2)
-    y_models.update(y_models_temp)
-    u_models_temp = train_channel_dwt_models(u_channel, u_coeffs, 'U', u_budget, u_hf_budget, device, train_only_level=2)
-    u_models.update(u_models_temp)
-    v_models_temp = train_channel_dwt_models(v_channel, v_coeffs, 'V', v_budget, v_hf_budget, device, train_only_level=2)
-    v_models.update(v_models_temp)
-    reconstruct_and_calc_psnr("After Level 2 Training", save_image=True)
+    
+    # Train each band and reconstruct after each
+    for idx, (ch_name, ch_data, ch_coeffs, budget, hf_budget, band_name) in enumerate(all_bands, 1):
+        print(f"\n[{idx}/21] Training {ch_name}-{band_name}...")
+        
+        # Train this specific band
+        new_models = train_channel_dwt_models(
+            ch_data, ch_coeffs, ch_name, budget, hf_budget, device, 
+            train_only_band=band_name
+        )
+        
+        # Update the appropriate model dict
+        if ch_name == 'Y':
+            y_models.update(new_models)
+        elif ch_name == 'U':
+            u_models.update(new_models)
+        else:  # V
+            v_models.update(new_models)
+        
+        # Reconstruct and show PSNR
+        reconstruct_and_calc_psnr(f"{ch_name}-{band_name}")
     
     train_time = time.time() - start_time
     
@@ -1094,14 +1109,19 @@ def main():
     print(f"\n  Total Model Size: {total_model_size_bytes:,} bytes ({total_model_size_kb:.2f} KB, {total_model_size_mb:.2f} MB)")
     print(f"  Saved to: {models_dir}")
     
-    # Final summary (final PSNR already shown in Stage 3)
+    # Final summary showing PSNR progression
     print(f"\n{'='*70}")
-    print(f"All Training and Reconstruction Complete!")
-    print(f"  Progressive reconstruction images saved in {LOG_DIR}")
+    print(f"Training Complete! PSNR Progression Summary:")
+    print(f"{'='*70}")
+    if band_psnrs:
+        final_psnr = band_psnrs[-1]
+        print(f"Final PSNR: Y={final_psnr['y']:.2f}, U={final_psnr['u']:.2f}, V={final_psnr['v']:.2f}, RGB={final_psnr['rgb']:.2f} dB")
+        print(f"Total training time: {train_time:.2f} seconds")
+        print(f"See above for per-band PSNR progression")
     print(f"{'='*70}")
     
-    # Save results
-    final_stage_psnrs = final_psnrs.get("After Level 2 Training", {})
+    # Save results with per-band PSNR progression
+    final_psnr = band_psnrs[-1] if band_psnrs else {'y': 0, 'u': 0, 'v': 0, 'rgb': 0}
     results = {
         'image_id': IMAGEID,
         'total_params': total_actual_params,
@@ -1109,11 +1129,11 @@ def main():
         'params_u': actual_params_u,
         'params_v': actual_params_v,
         'param_budget': TOTAL_PARAM_BUDGET,
-        'y_psnr': final_stage_psnrs.get('y', 0.0),
-        'u_psnr': final_stage_psnrs.get('u', 0.0),
-        'v_psnr': final_stage_psnrs.get('v', 0.0),
-        'rgb_psnr': final_stage_psnrs.get('rgb', 0.0),
-        'progressive_psnrs': final_psnrs,  # All stage PSNRs
+        'y_psnr': final_psnr['y'],
+        'u_psnr': final_psnr['u'],
+        'v_psnr': final_psnr['v'],
+        'rgb_psnr': final_psnr['rgb'],
+        'band_psnrs': band_psnrs,  # PSNR after each of 21 bands
         'train_time': train_time,
         'levels': LEVELS,
         'wavelet': WAVELET,
