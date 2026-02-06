@@ -5,8 +5,8 @@ from PIL import Image
 import os
 
 # Configuration
-IMAGEID = "kodim01"
-LEVELS = 1
+IMAGEID = "kodim02"
+LEVELS = 2
 WAVELET = "db4"
 OUTPUT_DIR = "results/dwt_split_yuv_channels/analysis"
 
@@ -50,7 +50,7 @@ def analyze_channel_distribution(channel_data, channel_name):
     
     return stats
 
-def analyze_dwt_coeffs(coeffs, channel_name, threshold_factor=1.0):
+def analyze_dwt_coeffs(coeffs, channel_name, threshold_factor=1.5):
     """Analyze DWT coefficient distributions"""
     print(f"\n{'='*70}")
     print(f"{channel_name} Channel - DWT Coefficient Analysis")
@@ -117,110 +117,79 @@ def plot_distributions(y_stats, u_stats, v_stats, output_dir):
     """Create distribution plots for all channels and bands"""
     os.makedirs(output_dir, exist_ok=True)
     
-    # Plot 1: Original channel distributions
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    # Create a comprehensive combined figure
+    fig = plt.figure(figsize=(20, 9))
+    gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
     
-    for idx, (channel_name, channel_coeffs) in enumerate([('Y', y_stats['LL']['coeffs']), 
-                                                            ('U', u_stats['LL']['coeffs']), 
-                                                            ('V', v_stats['LL']['coeffs'])]):
-        axes[idx].hist(channel_coeffs, bins=100, alpha=0.7, edgecolor='black')
-        axes[idx].set_title(f'{channel_name} Channel (LL Band) Distribution')
-        axes[idx].set_xlabel('Coefficient Value')
-        axes[idx].set_ylabel('Frequency')
-        axes[idx].grid(True, alpha=0.3)
+    # Row 1: LL band distributions for Y, U, V
+    for idx, (channel_name, stats) in enumerate([('Y', y_stats), ('U', u_stats), ('V', v_stats)]):
+        ax = fig.add_subplot(gs[0, idx])
+        channel_coeffs = stats['LL']['coeffs']
+        ax.hist(channel_coeffs, bins=100, alpha=0.7, edgecolor='black', color=f'C{idx}')
+        ax.set_title(f'{channel_name} Channel (LL Band)', fontweight='bold', fontsize=13)
+        ax.grid(True, alpha=0.3)
+        
+        # Add statistics and threshold
+        mean_val = stats['LL']['mean']
+        std_val = stats['LL']['std']
+        threshold = 1.5 * std_val
+        
+        # Mark threshold lines (mean-centered for LL band)
+        ax.axvline(mean_val + threshold, color='red', linestyle='--', linewidth=2, 
+                   alpha=0.7, label=f'Threshold (±{threshold:.2f})')
+        ax.axvline(mean_val - threshold, color='red', linestyle='--', linewidth=2, alpha=0.7)
+        ax.axvline(mean_val, color='green', linestyle=':', linewidth=1.5, alpha=0.6, label=f'Mean ({mean_val:.2f})')
+        
+        ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
+        
+        ax.text(0.02, 0.98, f'μ = {mean_val:.2f}\nσ = {std_val:.2f}\nThreshold = 1.5σ', 
+                transform=ax.transAxes, verticalalignment='top', fontsize=10,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray'))
     
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'channel_ll_distributions.png'), dpi=150)
-    print(f"\nSaved: {os.path.join(output_dir, 'channel_ll_distributions.png')}")
-    plt.close()
+    # Row 2-3: Selected HF bands (cH_L1, cV_L1, cD_L1 for L1 and L2)
+    hf_bands_to_plot = ['cH_L1', 'cV_L1', 'cD_L1', 'cH_L2', 'cV_L2', 'cD_L2']
     
-    # Plot 2: HF bands comparison
-    hf_bands = ['cH_L1', 'cV_L1', 'cD_L1', 'cH_L2', 'cV_L2', 'cD_L2']
-    
-    for band_name in hf_bands:
+    for band_idx, band_name in enumerate(hf_bands_to_plot):
+        row = 1 + band_idx // 3
+        col = band_idx % 3
+        
         if band_name not in y_stats:
             continue
             
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-        fig.suptitle(f'{band_name} Coefficient Distribution Across Channels', fontsize=14)
+        ax = fig.add_subplot(gs[row, col])
         
-        for idx, (channel_name, stats) in enumerate([('Y', y_stats), ('U', u_stats), ('V', v_stats)]):
+        # Plot all three channels overlaid
+        for channel_name, stats, color in [('Y', y_stats, 'C0'), ('U', u_stats, 'C1'), ('V', v_stats, 'C2')]:
             if band_name in stats:
                 coeffs = stats[band_name]['coeffs']
-                axes[idx].hist(coeffs, bins=100, alpha=0.7, edgecolor='black')
-                axes[idx].set_title(f'{channel_name} - {band_name}')
-                axes[idx].set_xlabel('Coefficient Value')
-                axes[idx].set_ylabel('Frequency')
-                axes[idx].axvline(0, color='red', linestyle='--', alpha=0.5, label='Zero')
-                
-                # Mark threshold
-                threshold = stats[band_name]['std']
-                axes[idx].axvline(threshold, color='green', linestyle='--', alpha=0.5, label=f'Threshold (±{threshold:.2f})')
-                axes[idx].axvline(-threshold, color='green', linestyle='--', alpha=0.5)
-                
-                axes[idx].legend()
-                axes[idx].grid(True, alpha=0.3)
+                ax.hist(coeffs, bins=80, alpha=0.4, label=channel_name, color=color, edgecolor='black')
         
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f'{band_name}_comparison.png'), dpi=150)
-        print(f"Saved: {os.path.join(output_dir, f'{band_name}_comparison.png')}")
-        plt.close()
+        ax.set_title(f'{band_name} Coefficients', fontweight='bold', fontsize=13)
+        ax.grid(True, alpha=0.3)
+        
+        # Add threshold lines (zero-centered for HF bands)
+        thresholds = []
+        for channel_name, stats, color in [('Y', y_stats, 'C0'), ('U', u_stats, 'C1'), ('V', v_stats, 'C2')]:
+            if band_name in stats:
+                threshold = 1.5 * stats[band_name]['std']
+                thresholds.append(threshold)
+        
+        if thresholds:
+            max_threshold = max(thresholds)
+            ax.axvline(max_threshold, color='red', linestyle='--', linewidth=2, 
+                      alpha=0.7, label=f'Threshold (±{max_threshold:.2f})')
+            ax.axvline(-max_threshold, color='red', linestyle='--', linewidth=2, alpha=0.7)
+        
+        ax.axvline(0, color='green', linestyle=':', linewidth=1.5, alpha=0.6, label='Zero')
+        ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
     
-    # Plot 3: Sparsity comparison
-    bands = ['LL']
-    y_sparsity = [y_stats['LL']['sparsity']]
-    u_sparsity = [u_stats['LL']['sparsity']]
-    v_sparsity = [v_stats['LL']['sparsity']]
+    # Add overall title
+    fig.suptitle('YUV DWT Coefficient Analysis - Complete Overview', fontsize=16, fontweight='bold', y=0.995)
     
-    for band_name in hf_bands:
-        if band_name in y_stats:
-            bands.append(band_name)
-            y_sparsity.append(y_stats[band_name]['sparsity'])
-            u_sparsity.append(u_stats[band_name]['sparsity'])
-            v_sparsity.append(v_stats[band_name]['sparsity'])
-    
-    x = np.arange(len(bands))
-    width = 0.25
-    
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar(x - width, y_sparsity, width, label='Y', alpha=0.8)
-    ax.bar(x, u_sparsity, width, label='U', alpha=0.8)
-    ax.bar(x + width, v_sparsity, width, label='V', alpha=0.8)
-    
-    ax.set_xlabel('Band')
-    ax.set_ylabel('Sparsity (%)')
-    ax.set_title('Coefficient Sparsity Comparison (threshold = 1.0 × std)')
-    ax.set_xticks(x)
-    ax.set_xticklabels(bands, rotation=45)
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'sparsity_comparison.png'), dpi=150)
-    print(f"Saved: {os.path.join(output_dir, 'sparsity_comparison.png')}")
-    plt.close()
-    
-    # Plot 4: Standard deviation comparison
-    y_stds = [y_stats[b]['std'] for b in bands]
-    u_stds = [u_stats[b]['std'] for b in bands]
-    v_stds = [v_stats[b]['std'] for b in bands]
-    
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar(x - width, y_stds, width, label='Y', alpha=0.8)
-    ax.bar(x, u_stds, width, label='U', alpha=0.8)
-    ax.bar(x + width, v_stds, width, label='V', alpha=0.8)
-    
-    ax.set_xlabel('Band')
-    ax.set_ylabel('Standard Deviation')
-    ax.set_title('Coefficient Standard Deviation Comparison')
-    ax.set_xticks(x)
-    ax.set_xticklabels(bands, rotation=45)
-    ax.legend()
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'std_comparison.png'), dpi=150)
-    print(f"Saved: {os.path.join(output_dir, 'std_comparison.png')}")
+    # Save combined figure
+    combined_path = os.path.join(output_dir, 'combined_distribution_analysis.png')
+    plt.savefig(combined_path, dpi=150, bbox_inches='tight')
+    print(f"\nSaved combined analysis: {combined_path}")
     plt.close()
 
 def main():

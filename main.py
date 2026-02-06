@@ -15,22 +15,25 @@ from training import Trainer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-ld", "--logdir", help="Path to save logs", default="./results/siren_main")
-parser.add_argument("-ni", "--num_iters", help="Number of iterations to train for", type=int, default=2000)
+parser.add_argument("-ni", "--num_iters", help="Number of iterations to train for", type=int, default=6000)
 parser.add_argument("-lr", "--learning_rate", help="Learning rate", type=float, default=2e-4)
 parser.add_argument("-se", "--seed", help="Random seed", type=int, default=random.randint(1, int(1e6)))
 parser.add_argument("-fd", "--full_dataset", help="Whether to use full dataset", action='store_true')
-parser.add_argument("-iid", "--image_id", help="Image ID to train on, if not the full dataset", type=int, default=1)
-parser.add_argument("-lss", "--layer_size", help="Layer sizes as list of ints", type=int, default=56)
-parser.add_argument("-nl", "--num_layers", help="Number of layers", type=int, default=20)
+parser.add_argument("-iid", "--image_id", help="Image ID to train on, if not the full dataset", type=int, default=8)
+parser.add_argument("-lss", "--layer_size", help="Layer sizes as list of ints", type=int, default=28)
+parser.add_argument("-nl", "--num_layers", help="Number of layers", type=int, default=10)
 parser.add_argument("-w0", "--w0", help="w0 parameter for SIREN model.", type=float, default=30.0)
 parser.add_argument("-w0i", "--w0_initial", help="w0 parameter for first layer of SIREN model.", type=float, default=30.0)
 
 args = parser.parse_args()
 
-# Set up torch and cuda
+# Set up torch and cuda - mixed precision training (requires CUDA)
+if not torch.cuda.is_available():
+    raise RuntimeError("Mixed precision training requires CUDA. Please run on GPU.")
+
 dtype = torch.float32
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-torch.set_default_tensor_type('torch.cuda.FloatTensor' if torch.cuda.is_available() else 'torch.FloatTensor')
+device = torch.device('cuda')
+torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
 # Set random seeds
 torch.manual_seed(args.seed)
@@ -41,8 +44,8 @@ if args.full_dataset:
 else:
     min_id, max_id = args.image_id, args.image_id
 
-# Dictionary to register mean values (both full precision and half precision)
-results = {'fp_bpp': [], 'hp_bpp': [], 'fp_psnr': [], 'hp_psnr': []}
+# Dictionary to register mixed precision results
+results = {'bpp': [], 'train_psnr': [], 'img_psnr': []}
 
 # Create directory to store experiments
 if not os.path.exists(args.logdir):
@@ -76,57 +79,38 @@ for i in range(min_id, max_id + 1):
     total_params = sum(p.numel() for p in func_rep.parameters() if p.requires_grad)
     print(f'Total parameters: {total_params:,}')
     
-    # Calculate model size. Divide by 8000 to go from bits to kB
-    model_size = util.model_size_in_bits(func_rep) / 8000.
-    print(f'Model size: {model_size:.1f}kB')
-    fp_bpp = util.bpp(model=func_rep, image=img)
-    print(f'Full precision bpp: {fp_bpp:.2f}')
+    # Calculate model size for FP16. Divide by 8000 to go from bits to kB
+    # Model weights stay in FP32, but will be saved as FP16
+    model_size = (total_params * 16) / 8000.  # 16 bits per param
+    print(f'Model size (FP16): {model_size:.1f}kB')
+    bpp = (total_params * 16) / (img.shape[1] * img.shape[2])
+    print(f'Mixed precision bpp: {bpp:.2f}')
 
-    # Train model in full precision
+    # Train model with mixed precision (AMP)
     trainer.train(coordinates, features, num_iters=args.num_iters)
     print(f'Best training psnr: {trainer.best_vals["psnr"]:.2f}')
 
-    # Log full precision results
-    results['fp_bpp'].append(fp_bpp)
-    results['fp_psnr'].append(trainer.best_vals['psnr'])
+    # Log results
+    results['bpp'].append(bpp)
+    results['train_psnr'].append(trainer.best_vals['psnr'])
 
-    # Save best model
-    torch.save(trainer.best_model, args.logdir + f'/best_model_{i}.pt')
+    # Save best model (convert to FP16 for storage)
+    best_model_fp16 = {k: v.half() for k, v in trainer.best_model.items()}
+    torch.save(best_model_fp16, args.logdir + f'/best_model_{i}.pt')
 
     # Update current model to be best model
     func_rep.load_state_dict(trainer.best_model)
 
-    # Save full precision image reconstruction
+    # Inference with FP16 for memory efficiency
+    func_rep = func_rep.half()
+    coordinates = coordinates.half()
+    
     with torch.no_grad():
-        img_recon = func_rep(coordinates).reshape(img.shape[1], img.shape[2], 3).permute(2, 0, 1)
-        
-        # Calculate image-level PSNR for full precision
-        fp_img_psnr = util.get_clamped_psnr(img_recon, img)
-        print(f'Full precision RGB PSNR: {fp_img_psnr:.2f} dB')
-        
-        save_image(torch.clamp(img_recon, 0, 1).to('cpu'), args.logdir + f'/fp_reconstruction_{i}.png')
-
-    # Convert model and coordinates to half precision. Note that half precision
-    # torch.sin is only implemented on GPU, so must use cuda
-    if torch.cuda.is_available():
-        func_rep = func_rep.half().to('cuda')
-        coordinates = coordinates.half().to('cuda')
-
-        # Calculate model size in half precision
-        hp_bpp = util.bpp(model=func_rep, image=img)
-        results['hp_bpp'].append(hp_bpp)
-        print(f'Half precision bpp: {hp_bpp:.2f}')
-
-        # Compute image reconstruction and PSNR
-        with torch.no_grad():
-            img_recon = func_rep(coordinates).reshape(img.shape[1], img.shape[2], 3).permute(2, 0, 1).float()
-            hp_psnr = util.get_clamped_psnr(img_recon, img)
-            save_image(torch.clamp(img_recon, 0, 1).to('cpu'), args.logdir + f'/hp_reconstruction_{i}.png')
-            print(f'Half precision RGB PSNR: {hp_psnr:.2f} dB')
-            results['hp_psnr'].append(hp_psnr)
-    else:
-        results['hp_bpp'].append(fp_bpp)
-        results['hp_psnr'].append(0.0)
+        img_recon = func_rep(coordinates).float().reshape(img.shape[1], img.shape[2], 3).permute(2, 0, 1)
+        img_psnr = util.get_clamped_psnr(img_recon, img)
+        results['img_psnr'].append(img_psnr)
+        print(f'Image PSNR (FP16 inference): {img_psnr:.2f} dB')
+        save_image(torch.clamp(img_recon, 0, 1).to('cpu'), args.logdir + f'/reconstruction_{i}.png')
 
     # Save logs for individual image
     with open(args.logdir + f'/logs{i}.json', 'w') as f:
@@ -134,7 +118,7 @@ for i in range(min_id, max_id + 1):
 
     print('\n')
 
-print('Full results:')
+print('Results (Mixed Precision Training):')
 print(results)
 with open(args.logdir + f'/results.json', 'w') as f:
     json.dump(results, f)
@@ -144,6 +128,7 @@ results_mean = {key: util.mean(results[key]) for key in results}
 with open(args.logdir + f'/results_mean.json', 'w') as f:
     json.dump(results_mean, f)
 
-print('Aggregate results:')
-print(f'Full precision, bpp: {results_mean["fp_bpp"]:.2f}, psnr: {results_mean["fp_psnr"]:.2f}')
-print(f'Half precision, bpp: {results_mean["hp_bpp"]:.2f}, psnr: {results_mean["hp_psnr"]:.2f}')
+print('\nAggregate results:')
+print(f'BPP: {results_mean["bpp"]:.2f}')
+print(f'Training PSNR: {results_mean["train_psnr"]:.2f} dB')
+print(f'Image PSNR (FP16): {results_mean["img_psnr"]:.2f} dB')

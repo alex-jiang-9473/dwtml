@@ -27,7 +27,7 @@ class Trainer():
         self._cached_encoding = None
 
     def train(self, coordinates, features, num_iters):
-        """Fit neural net to image.
+        """Fit neural net to image with automatic mixed precision.
 
         Args:
             coordinates (torch.Tensor): Tensor of coordinates.
@@ -35,17 +35,24 @@ class Trainer():
             features (torch.Tensor): Tensor of features. Shape (num_points, feature_dim).
             num_iters (int): Number of iterations to train for.
         """
+        scaler = torch.amp.GradScaler('cuda')
+        
         with tqdm.trange(num_iters, ncols=100, dynamic_ncols=True) as t:
             for i in t:
-                # Update model
+                # Update model with mixed precision
                 self.optimizer.zero_grad()
-                predicted = self.representation(coordinates)
-                loss = self.loss_func(predicted, features)
-                loss.backward()
-                self.optimizer.step()
+                
+                with torch.amp.autocast('cuda'):
+                    predicted = self.representation(coordinates)
+                    loss = self.loss_func(predicted, features)
+                
+                scaler.scale(loss).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
 
-                # Calculate psnr
-                psnr = get_clamped_psnr(predicted, features)
+                # Calculate psnr in FP32 for stability
+                with torch.no_grad():
+                    psnr = get_clamped_psnr(predicted.float(), features.float())
 
                 # Print results and update logs
                 log_dict = {'loss': loss.item(),
@@ -60,8 +67,7 @@ class Trainer():
                     self.best_vals['loss'] = loss.item()
                 if psnr > self.best_vals['psnr']:
                     self.best_vals['psnr'] = psnr
-                    # If model achieves best PSNR seen during training, update
-                    # model
+                    # If model achieves best PSNR seen during training, update model
                     if i > int(num_iters / 2.):
                         for k, v in self.representation.state_dict().items():
                             self.best_model[k].copy_(v)
