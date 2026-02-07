@@ -46,14 +46,17 @@ def train_single_band_worker(args):
         args: Tuple of (band_idx, channel_name, band_name, channel_data, coeffs, budget, hf_budget, device_id)
     
     Returns:
-        Tuple of (band_idx, channel_name, band_name, models_dict)
+        Tuple of (band_idx, channel_name, band_name, models_dict, process_id)
     """
     band_idx, ch_name, band_name, ch_data, ch_coeffs, budget, hf_budget, device_id = args
+    
+    # Get process ID to identify which worker is handling this
+    pid = os.getpid()
     
     # Set device for this worker
     device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
     
-    print(f"[Worker {band_idx}] Training {ch_name}-{band_name} on {device}...")
+    print(f"[PID {pid}] [Band {band_idx}/21] Training {ch_name}-{band_name} on {device}...")
     start = time.time()
     
     # Train this specific band
@@ -63,19 +66,19 @@ def train_single_band_worker(args):
             train_only_band=band_name
         )
         elapsed = time.time() - start
-        print(f"[Worker {band_idx}] ✓ {ch_name}-{band_name} completed in {elapsed:.1f}s")
+        print(f"[PID {pid}] [Band {band_idx}/21] ✓ {ch_name}-{band_name} completed in {elapsed:.1f}s")
         
         # Move models to CPU to avoid CUDA IPC issues across processes
         for band_key, model_info in models.items():
             if 'model' in model_info:
                 model_info['model'].cpu()
         
-        return (band_idx, ch_name, band_name, models)
+        return (band_idx, ch_name, band_name, models, pid)
     except Exception as e:
-        print(f"[Worker {band_idx}] ✗ {ch_name}-{band_name} failed: {e}")
+        print(f"[PID {pid}] [Band {band_idx}/21] ✗ {ch_name}-{band_name} failed: {e}")
         import traceback
         traceback.print_exc()
-        return (band_idx, ch_name, band_name, None)
+        return (band_idx, ch_name, band_name, None, pid)
 
 
 def reconstruct_and_calc_psnr(y_models, u_models, v_models, y_channel, u_channel, v_channel, 
@@ -200,7 +203,9 @@ def main():
         all_bands.append(('V', v_channel, v_coeffs, v_budget, v_hf_budget, band_type))
     
     print(f"\n{'='*70}")
-    print(f"Training All 21 Sub-bands in Parallel ({NUM_PARALLEL_WORKERS} workers)")
+    print(f"Training All 21 Sub-bands in Parallel")
+    print(f"  {NUM_PARALLEL_WORKERS} worker processes (up to {NUM_PARALLEL_WORKERS} bands at once)")
+    print(f"  Bands will complete in non-sequential order")
     print(f"{'='*70}")
     
     # Prepare worker arguments
@@ -215,6 +220,10 @@ def main():
     v_models = {}
     band_psnrs = []
     
+    # Track process IDs to assign friendly worker numbers and bands handled
+    pid_to_worker = {}
+    worker_to_bands = {}  # worker_num -> list of (band_idx, ch_name, band_name)
+    
     # Train in parallel
     start_time = time.time()
     completed_count = 0
@@ -225,7 +234,17 @@ def main():
         
         # Process results as they complete
         for future in as_completed(futures):
-            band_idx, ch_name, band_name, models = future.result()
+            band_idx, ch_name, band_name, models, pid = future.result()
+            
+            # Assign friendly worker number
+            if pid not in pid_to_worker:
+                pid_to_worker[pid] = len(pid_to_worker) + 1
+            worker_num = pid_to_worker[pid]
+            
+            # Track which bands this worker handled
+            if worker_num not in worker_to_bands:
+                worker_to_bands[worker_num] = []
+            worker_to_bands[worker_num].append((band_idx, ch_name, band_name))
             
             if models is not None:
                 # Update appropriate model dict
@@ -248,7 +267,7 @@ def main():
                 )
                 
                 if psnrs:
-                    print(f"\n[{completed_count}/21] After {ch_name}-{band_name}:")
+                    print(f"\n[Worker {worker_num}] [{completed_count}/21] After {ch_name}-{band_name}:")
                     print(f"  PSNR: Y={psnrs['y']:.2f}, U={psnrs['u']:.2f}, V={psnrs['v']:.2f}, RGB={psnrs['rgb']:.2f} dB")
                     
                     band_psnrs.append({
@@ -259,9 +278,30 @@ def main():
                         'rgb': psnrs['rgb']
                     })
                 else:
-                    print(f"\n[{completed_count}/21] {ch_name}-{band_name} trained (PSNR pending - need all LL bands)")
+                    print(f"\n[Worker {worker_num}] [{completed_count}/21] {ch_name}-{band_name} trained (PSNR pending - need all LL bands)")
     
     train_time = time.time() - start_time
+    
+    # Print worker utilization summary
+    print(f"\n{'='*70}")
+    print(f"Worker Utilization Summary:")
+    print(f"  Total Workers Used: {len(worker_to_bands)} / {NUM_PARALLEL_WORKERS}")
+    
+    # Map PID to worker number for display
+    pid_to_worker_for_display = {pid: worker for pid, worker in pid_to_worker.items()}
+    
+    for worker_num in sorted(worker_to_bands.keys()):
+        bands = worker_to_bands[worker_num]
+        # Find the PID for this worker
+        pid = [pid for pid, wn in pid_to_worker.items() if wn == worker_num][0]
+        
+        # Sort bands by band_idx
+        bands_sorted = sorted(bands, key=lambda x: x[0])
+        band_list = [f"{ch}-{bn}" for _, ch, bn in bands_sorted]
+        
+        print(f"  Worker {worker_num} (PID {pid}): {len(bands)} bands")
+        print(f"    Bands: {', '.join(band_list)}")
+    print(f"{'='*70}")
     
     # Calculate actual total parameters
     actual_params_y = sum(info['params'] for info in y_models.values())
