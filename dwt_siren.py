@@ -1,6 +1,7 @@
 import os
 import random
 import json
+import time
 import numpy as np
 import pywt
 import torch
@@ -9,6 +10,7 @@ from torchvision import transforms
 from training import Trainer
 from siren import Siren
 import util
+from resource_monitor import ResourceMonitor, print_memory_stats, reset_cuda_memory
 
 # ---------------------------
 # CONFIG
@@ -24,8 +26,12 @@ OUTPUT_FILE = os.path.join(LOG_DIR, f"{IMAGEID}_dwt_siren_L{NUM_LAYERS}_S{LAYER_
 # ---------------------------
 
 def main():
-    import time
     start_time = time.time()
+    
+    # Initialize resource monitoring
+    monitor = ResourceMonitor(device='cuda' if torch.cuda.is_available() else 'cpu')
+    monitor.start()
+    print_memory_stats("Memory at script start", device='cuda' if torch.cuda.is_available() else 'cpu')
     
     # 1) Load and prepare grayscale image
     img = Image.open(f"kodak-dataset/{IMAGEID}.png").convert("L")
@@ -81,6 +87,8 @@ def main():
     
     # Convert normalized coefficients to tensor
     coeffs_tensor = transforms.ToTensor()(arr_norm).float().to(device, dtype)
+
+    print_memory_stats("Memory before model creation", device='cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize SIREN model
     func_rep = Siren(
@@ -242,6 +250,14 @@ def main():
             print(f"Peak GPU memory: {gpu_memory_mb:.2f} MB")
 
     print("DWT Results:", results)
+    
+    # Log final resource statistics
+    print_memory_stats("Memory at script end", device='cuda' if torch.cuda.is_available() else 'cpu')
+    monitor.print_summary()
+    
+    # Save resource summary
+    resource_summary_path = os.path.join(LOG_DIR, f"{IMAGEID}_dwt_resource_summary.json")
+    monitor.save_summary(resource_summary_path)
 
 if __name__ == "__main__":
     main()

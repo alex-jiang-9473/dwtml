@@ -13,30 +13,31 @@ from PIL import Image
 from training import Trainer
 from siren import Siren
 import util
+from resource_monitor import ResourceMonitor, print_memory_stats, reset_cuda_memory, get_memory_stats
 
 # ---------------------------
 # CONFIG
 LEVELS = 2        # Number of DWT decomposition levels
 WAVELET = "db4"   # Wavelet type
 LOG_DIR = "results/dwt_split_yuv_channels"
-IMAGEID = "kodim02"  # Image to compress
+IMAGEID = "kodim08"  # Image to compress
 
 # Parameter budget from original RGB SIREN (10 layers, 28 hidden, 3 outputs)
-# TOTAL_PARAM_BUDGET = 4346
-TOTAL_PARAM_BUDGET = 60987
+TOTAL_PARAM_BUDGET = 7479
+# TOTAL_PARAM_BUDGET = 60987
 
 ITERA = 2000  # Training iterations per band model
-ITERA_FACTOR = 1  # Global multiplier for training iterations (adjust for speed/quality tradeoff)
+ITERA_FACTOR = 5  # Global multiplier for training iterations (adjust for speed/quality tradeoff)
 
 # Parameter allocation percentages for YUV channels
-Y_BUDGET_PERCENT = 0.6   # 70% for Y (luminance)
-U_BUDGET_PERCENT = 0.2   # 15% for U (chrominance)
-V_BUDGET_PERCENT = 0.2   # 15% for V (chrominance)
+Y_BUDGET_PERCENT = 0.8   # 70% for Y (luminance)
+U_BUDGET_PERCENT = 0.1   # 15% for U (chrominance)
+V_BUDGET_PERCENT = 0.1   # 15% for V (chrominance)
 
 # HF bands parameter budget (as percentage of total budget)
 # These are PART OF the channel budgets above, not additional
 # LL budget = Channel budget - HF budget
-Y_HF_BUDGET_PERCENT = 0.3   # 18% for Y channel HF bands (out of Y's 70%)
+Y_HF_BUDGET_PERCENT = 0.1   # 18% for Y channel HF bands (out of Y's 70%)
 U_HF_BUDGET_PERCENT = 0.1   # 9% for U channel HF bands (out of U's 15%)
 V_HF_BUDGET_PERCENT = 0.1   # 9% for V channel HF bands (out of V's 15%)
 
@@ -44,7 +45,7 @@ V_HF_BUDGET_PERCENT = 0.1   # 9% for V channel HF bands (out of V's 15%)
 THRESHOLD_FACTOR = 1.5  # Increased from 1.0 to keep only important coefficients
 
 # Training options
-SKIP_HF_TRAINING = False  # Set to True to only train LL bands (skip all HF bands)
+SKIP_HF_TRAINING = True  # Set to True to only train LL bands (skip all HF bands)
 USE_COMBINED_HF = False    # Combine cH, cV, cD into single 3-output model per level
 USE_FP16 = True           # Use mixed precision (fp16) training for faster training and less memory
 
@@ -96,27 +97,39 @@ def calculate_model_params(layers, hidden_size, dim_in=2, dim_out=1):
     
     return first_layer + hidden_layers + output_layer
 
-def find_model_size_for_budget(target_params, dim_in=2, dim_out=1):
+def find_model_size_for_budget(target_params, dim_in=2, dim_out=1, strict_under=True):
     """Find (layers, hidden_size) that fits within parameter budget
     
     Constraint: hidden_size = 3 * layers (neurons are three times of layers)
     
-    Returns (layers, hidden_size) that gets closest to target_params
+    Args:
+        target_params: Target parameter count
+        dim_in: Input dimension
+        dim_out: Output dimension
+        strict_under: If True, only return configs UNDER target_params
+    
+    Returns (layers, hidden_size) that gets closest to target_params without exceeding it
     """
-    best_config = (3, 9)
-    best_diff = float('inf')
+    best_config = (1, 3)  # Start with minimum size (1 layer, hidden_size=3)
+    best_params = calculate_model_params(1, 3, dim_in, dim_out)
+    best_diff = abs(best_params - target_params)
     
     # Search with constraint: hidden_size = 3 * layers
-    for layers in range(3, 100):
+    for layers in range(1, 100):
         hidden_size = 3 * layers  # Enforce constraint
         params = calculate_model_params(layers, hidden_size, dim_in, dim_out)
-        diff = abs(params - target_params)
         
+        # If strict, only consider configs under budget
+        if strict_under and params > target_params:
+            break
+        
+        diff = abs(params - target_params)
         if diff < best_diff:
             best_diff = diff
             best_config = (layers, hidden_size)
+            best_params = params
         
-        # If we're over budget, stop searching
+        # If we're over budget and not strict, stop searching
         if params > target_params:
             break
     
@@ -163,7 +176,6 @@ def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, cha
     
     # LL band - only Y channel trains ALL pixels, U/V use thresholding
     ll_coeffs = channel_coeffs[0]
-    ll_energy = np.sum(ll_coeffs ** 2)
     
     if channel_name == 'Y':
         # Y channel LL: train ALL pixels
@@ -175,18 +187,17 @@ def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, cha
         ll_pixels = np.sum(sparse_mask)
     
     if ll_pixels > 0:
-        band_info.append(('LL', ll_coeffs, ll_energy, ll_pixels, 0))  # level=0 for LL
+        band_info.append(('LL', ll_coeffs, ll_pixels, 0))  # level=0 for LL
     
-    # LL band allocation - use total_budget (LL budget)
+    # LL band allocation - use total_budget (LL budget) with strict enforcement
     allocations = {}
-    layers, hidden_size = find_model_size_for_budget(total_budget)
-    actual_params = calculate_model_params(layers, hidden_size)
+    layers, hidden_size = find_model_size_for_budget(total_budget, dim_in=2, dim_out=1, strict_under=True)
+    actual_params = calculate_model_params(layers, hidden_size, dim_in=2, dim_out=1)
     
     allocations['LL'] = {
         'layers': layers,
         'hidden_size': hidden_size,
         'params': actual_params,
-        'energy': ll_energy,
         'num_coeffs': ll_pixels
     }
     
@@ -199,7 +210,6 @@ def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, cha
         if USE_COMBINED_HF:
             # Combined mode: count all HF coefficients together at this level
             total_sparse = 0
-            total_energy = 0
             
             for band_name, coeffs in [('cH', cH), ('cV', cV), ('cD', cD)]:
                 threshold = THRESHOLD_FACTOR * np.std(coeffs)
@@ -207,14 +217,11 @@ def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, cha
                 sparse_mask = np.abs(coeffs) > threshold
                 num_sparse = np.sum(sparse_mask)
                 total_sparse += num_sparse
-                
-                if num_sparse > 0:
-                    total_energy += np.sum(coeffs[sparse_mask] ** 2)
             
             if total_sparse > 0:
                 band_full_name = f"HF_L{level_idx}"  # Combined name
                 # Use cH coeffs as placeholder for shape
-                band_info.append((band_full_name, cH, total_energy, total_sparse, level_idx))
+                band_info.append((band_full_name, cH, total_sparse, level_idx))
         else:
             # Separate mode: count sparse coefficients for each band
             for band_name, coeffs in [('cH', cH), ('cV', cV), ('cD', cD)]:
@@ -225,15 +232,14 @@ def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, cha
                 num_sparse = np.sum(sparse_mask)
                 
                 if num_sparse > 0:
-                    energy = np.sum(coeffs[sparse_mask] ** 2)
                     band_full_name = f"{band_name}_L{level_idx}"
-                    band_info.append((band_full_name, coeffs, energy, num_sparse, level_idx))
+                    band_info.append((band_full_name, coeffs, num_sparse, level_idx))
     
     # Calculate allocation weights with importance scaling for HF bands only
     # LL band was already allocated above
     # Importance hierarchy: L1 HF > L2 HF
     weighted_coeffs = []
-    for band_name, coeffs, energy, num_coeffs, level in band_info:
+    for band_name, coeffs, num_coeffs, level in band_info:
         if level == 0:  # Skip LL - already allocated
             continue
         elif level == 1:  # L1 HF bands - higher importance  
@@ -241,38 +247,64 @@ def allocate_parameters_per_channel(channel_coeffs, total_budget, hf_budget, cha
         else:  # L2 HF bands
             importance = 0.8
         
-        weighted_coeffs.append((band_name, coeffs, energy, num_coeffs, level, importance * num_coeffs))
+        weighted_coeffs.append((band_name, coeffs, num_coeffs, level, importance * num_coeffs))
+    
+    # If no HF bands or HF budget too small, skip
+    if not weighted_coeffs or hf_budget < 50:
+        return allocations
     
     total_weighted = sum(info[5] for info in weighted_coeffs)
     
-    remaining_budget = hf_budget
+    # Minimum viable model size (1 layer, 3 hidden)
+    min_model_params = calculate_model_params(1, 3, dim_in=2, dim_out=1)
     
-    # Allocate HF bands based on weighted coefficient count
-    for i, (band_name, coeffs, energy, num_coeffs, level, weighted_count) in enumerate(weighted_coeffs):
-        if i == len(weighted_coeffs) - 1:
-            # Last band gets remaining budget
+    # First pass: determine which bands can be allocated
+    viable_bands = []
+    for band_name, coeffs, num_coeffs, level, weighted_count in weighted_coeffs:
+        weight = weighted_count / total_weighted if total_weighted > 0 else 1.0 / len(weighted_coeffs)
+        initial_allocation = int(hf_budget * weight)
+        
+        # Check if this band can get minimum viable model
+        if initial_allocation >= min_model_params:
+            viable_bands.append((band_name, coeffs, num_coeffs, level, weighted_count, weight))
+    
+    # If no viable bands, skip HF allocation
+    if not viable_bands:
+        return allocations
+    
+    # Second pass: allocate to viable bands with strict budget enforcement
+    remaining_budget = hf_budget
+    for i, (band_name, coeffs, num_coeffs, level, weighted_count, weight) in enumerate(viable_bands):
+        if i == len(viable_bands) - 1:
+            # Last band gets all remaining budget
             allocated = remaining_budget
         else:
-            # Allocate proportionally to weighted coefficient count
-            weight = weighted_count / total_weighted if total_weighted > 0 else 1.0 / len(weighted_coeffs)
+            # Allocate proportionally
             allocated = int(hf_budget * weight)
-            
-            # Minimum for HF bands
-            allocated = max(500, allocated)
         
-        # Find best model size for this budget
-        layers, hidden_size = find_model_size_for_budget(allocated)
-        actual_params = calculate_model_params(layers, hidden_size)
+        # Make sure we don't exceed remaining budget
+        allocated = min(allocated, remaining_budget)
+        
+        if allocated < min_model_params:
+            # Skip if not enough budget
+            continue
+        
+        # Find best model size UNDER this budget
+        layers, hidden_size = find_model_size_for_budget(allocated, dim_in=2, dim_out=1, strict_under=True)
+        actual_params = calculate_model_params(layers, hidden_size, dim_in=2, dim_out=1)
         
         allocations[band_name] = {
             'layers': layers,
             'hidden_size': hidden_size,
             'params': actual_params,
-            'energy': energy,
             'num_coeffs': num_coeffs
         }
         
         remaining_budget -= actual_params
+        
+        # Safety check: stop if we run out of budget
+        if remaining_budget < min_model_params:
+            break
     
     return allocations
 
@@ -437,12 +469,12 @@ def train_channel_dwt_models(channel_data, channel_coeffs, channel_name, param_b
     if not train_only_ll and train_only_level is None:
         total_allocated = sum(info['params'] for info in allocations.values())
         print(f"\nParameter Allocation for {channel_name} Channel:")
-        print(f"  {'Band':<12} {'Layers':<8} {'Hidden':<8} {'Params':<10} {'Energy':<12} {'Coeffs':<10}")
-        print(f"  {'-'*70}")
+        print(f"  {'Band':<12} {'Layers':<8} {'Hidden':<8} {'Params':<10} {'Coeffs':<10}")
+        print(f"  {'-'*60}")
         for band_name, info in allocations.items():
             print(f"  {band_name:<12} {info['layers']:<8} {info['hidden_size']:<8} "
-                  f"{info['params']:<10,} {info['energy']:<12.2f} {info['num_coeffs']:<10}")
-        print(f"  {'-'*70}")
+                  f"{info['params']:<10,} {info['num_coeffs']:<10}")
+        print(f"  {'-'*60}")
         print(f"  {'TOTAL':<12} {'':<8} {'':<8} {total_allocated:<10,}")
         print()
     
@@ -912,6 +944,11 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    # Initialize resource monitoring
+    monitor = ResourceMonitor(device='cuda' if torch.cuda.is_available() else 'cpu')
+    monitor.start()
+    print_memory_stats("Memory at script start", device='cuda' if torch.cuda.is_available() else 'cpu')
+    
     # Create output directory
     os.makedirs(LOG_DIR, exist_ok=True)
     
@@ -934,6 +971,8 @@ def main():
     
     # Perform DWT on each channel
     print(f"\nPerforming {LEVELS}-level DWT with {WAVELET} wavelet on each channel...")
+    print_memory_stats("Memory before DWT", device='cuda' if torch.cuda.is_available() else 'cpu')
+    
     y_coeffs = pywt.wavedec2(y_channel, WAVELET, level=LEVELS)
     u_coeffs = pywt.wavedec2(u_channel, WAVELET, level=LEVELS)
     v_coeffs = pywt.wavedec2(v_channel, WAVELET, level=LEVELS)
@@ -942,13 +981,84 @@ def main():
     # Y gets more parameters (it carries more information)
     # U and V get equal share of the rest (chroma has less detail)
     # HF budgets are part of the channel budgets (subtracted from channel total)
-    y_hf_budget = int(TOTAL_PARAM_BUDGET * Y_HF_BUDGET_PERCENT)
-    u_hf_budget = int(TOTAL_PARAM_BUDGET * U_HF_BUDGET_PERCENT)
-    v_hf_budget = int(TOTAL_PARAM_BUDGET * V_HF_BUDGET_PERCENT)
     
-    y_budget = int(TOTAL_PARAM_BUDGET * Y_BUDGET_PERCENT) - y_hf_budget  # LL budget for Y
-    u_budget = int(TOTAL_PARAM_BUDGET * U_BUDGET_PERCENT) - u_hf_budget  # LL budget for U
-    v_budget = int(TOTAL_PARAM_BUDGET * V_BUDGET_PERCENT) - v_hf_budget  # LL budget for V
+    # When skipping HF training, assign ALL params to LL bands
+    if SKIP_HF_TRAINING:
+        y_hf_budget = 0
+        u_hf_budget = 0
+        v_hf_budget = 0
+        y_budget = int(TOTAL_PARAM_BUDGET * Y_BUDGET_PERCENT)  # Full channel budget for LL
+        u_budget = int(TOTAL_PARAM_BUDGET * U_BUDGET_PERCENT)  # Full channel budget for LL
+        v_budget = int(TOTAL_PARAM_BUDGET * V_BUDGET_PERCENT)  # Full channel budget for LL
+    else:
+        y_hf_budget = int(TOTAL_PARAM_BUDGET * Y_HF_BUDGET_PERCENT)
+        u_hf_budget = int(TOTAL_PARAM_BUDGET * U_HF_BUDGET_PERCENT)
+        v_hf_budget = int(TOTAL_PARAM_BUDGET * V_HF_BUDGET_PERCENT)
+        y_budget = int(TOTAL_PARAM_BUDGET * Y_BUDGET_PERCENT) - y_hf_budget  # LL budget for Y
+        u_budget = int(TOTAL_PARAM_BUDGET * U_BUDGET_PERCENT) - u_hf_budget  # LL budget for U
+        v_budget = int(TOTAL_PARAM_BUDGET * V_BUDGET_PERCENT) - v_hf_budget  # LL budget for V
+    
+    # Get actual params for initial allocation
+    y_ll_layers, y_ll_hidden = find_model_size_for_budget(y_budget, dim_in=2, dim_out=1, strict_under=True)
+    y_ll_actual = calculate_model_params(y_ll_layers, y_ll_hidden, dim_in=2, dim_out=1)
+    
+    u_ll_layers, u_ll_hidden = find_model_size_for_budget(u_budget, dim_in=2, dim_out=1, strict_under=True)
+    u_ll_actual = calculate_model_params(u_ll_layers, u_ll_hidden, dim_in=2, dim_out=1)
+    
+    v_ll_layers, v_ll_hidden = find_model_size_for_budget(v_budget, dim_in=2, dim_out=1, strict_under=True)
+    v_ll_actual = calculate_model_params(v_ll_layers, v_ll_hidden, dim_in=2, dim_out=1)
+    
+    # Calculate leftover budget from LL bands
+    total_ll_actual = y_ll_actual + u_ll_actual + v_ll_actual
+    leftover = TOTAL_PARAM_BUDGET - total_ll_actual - (y_hf_budget + u_hf_budget + v_hf_budget)
+    
+    # Redistribute leftover to LL bands in priority: Y > U > V
+    # But respect the TOTAL_PARAM_BUDGET constraint
+    if leftover > 0 and SKIP_HF_TRAINING:
+        # Try to add to Y first
+        available_for_y = TOTAL_PARAM_BUDGET - (u_ll_actual + v_ll_actual)
+        new_y_budget = min(y_budget + leftover, available_for_y)
+        new_y_ll_layers, new_y_ll_hidden = find_model_size_for_budget(new_y_budget, dim_in=2, dim_out=1, strict_under=True)
+        new_y_ll_actual = calculate_model_params(new_y_ll_layers, new_y_ll_hidden, dim_in=2, dim_out=1)
+        
+        if new_y_ll_actual > y_ll_actual and (new_y_ll_actual + u_ll_actual + v_ll_actual) <= TOTAL_PARAM_BUDGET:
+            y_ll_layers = new_y_ll_layers
+            y_ll_hidden = new_y_ll_hidden
+            y_ll_actual = new_y_ll_actual
+            leftover = TOTAL_PARAM_BUDGET - (y_ll_actual + u_ll_actual + v_ll_actual)
+        
+        # Try to add remaining to U
+        if leftover > 0:
+            available_for_u = TOTAL_PARAM_BUDGET - (y_ll_actual + v_ll_actual)
+            new_u_budget = min(u_budget + leftover, available_for_u)
+            new_u_ll_layers, new_u_ll_hidden = find_model_size_for_budget(new_u_budget, dim_in=2, dim_out=1, strict_under=True)
+            new_u_ll_actual = calculate_model_params(new_u_ll_layers, new_u_ll_hidden, dim_in=2, dim_out=1)
+            
+            if new_u_ll_actual > u_ll_actual and (y_ll_actual + new_u_ll_actual + v_ll_actual) <= TOTAL_PARAM_BUDGET:
+                u_ll_layers = new_u_ll_layers
+                u_ll_hidden = new_u_ll_hidden
+                u_ll_actual = new_u_ll_actual
+                leftover = TOTAL_PARAM_BUDGET - (y_ll_actual + u_ll_actual + v_ll_actual)
+        
+        # Try to add remaining to V
+        if leftover > 0:
+            available_for_v = TOTAL_PARAM_BUDGET - (y_ll_actual + u_ll_actual)
+            new_v_budget = min(v_budget + leftover, available_for_v)
+            new_v_ll_layers, new_v_ll_hidden = find_model_size_for_budget(new_v_budget, dim_in=2, dim_out=1, strict_under=True)
+            new_v_ll_actual = calculate_model_params(new_v_ll_layers, new_v_ll_hidden, dim_in=2, dim_out=1)
+            
+            if new_v_ll_actual > v_ll_actual and (y_ll_actual + u_ll_actual + new_v_ll_actual) <= TOTAL_PARAM_BUDGET:
+                v_ll_layers = new_v_ll_layers
+                v_ll_hidden = new_v_ll_hidden
+                v_ll_actual = new_v_ll_actual
+                leftover = TOTAL_PARAM_BUDGET - (y_ll_actual + u_ll_actual + v_ll_actual)
+        
+        # Update budgets to match actual allocations (for display purposes)
+        y_budget = y_ll_actual
+        u_budget = u_ll_actual
+        v_budget = v_ll_actual
+    
+    total_ll_actual = y_ll_actual + u_ll_actual + v_ll_actual
     
     y_ll_percent = (y_budget / TOTAL_PARAM_BUDGET) * 100
     u_ll_percent = (u_budget / TOTAL_PARAM_BUDGET) * 100
@@ -956,9 +1066,15 @@ def main():
     
     print(f"\nParameter Budget Allocation:")
     print(f"  Total Budget: {TOTAL_PARAM_BUDGET:,} parameters")
-    print(f"  Y Channel: {int(TOTAL_PARAM_BUDGET * Y_BUDGET_PERCENT):,} ({100*Y_BUDGET_PERCENT:.1f}%) = LL {y_budget:,} ({y_ll_percent:.1f}%) + HF {y_hf_budget:,} ({100*Y_HF_BUDGET_PERCENT:.1f}%)")
-    print(f"  U Channel: {int(TOTAL_PARAM_BUDGET * U_BUDGET_PERCENT):,} ({100*U_BUDGET_PERCENT:.1f}%) = LL {u_budget:,} ({u_ll_percent:.1f}%) + HF {u_hf_budget:,} ({100*U_HF_BUDGET_PERCENT:.1f}%)")
-    print(f"  V Channel: {int(TOTAL_PARAM_BUDGET * V_BUDGET_PERCENT):,} ({100*V_BUDGET_PERCENT:.1f}%) = LL {v_budget:,} ({v_ll_percent:.1f}%) + HF {v_hf_budget:,} ({100*V_HF_BUDGET_PERCENT:.1f}%)")
+    if SKIP_HF_TRAINING:
+        print(f"  Y Channel LL: {y_budget:,} ({y_ll_percent:.1f}%) → actual: {y_ll_actual:,}")
+        print(f"  U Channel LL: {u_budget:,} ({u_ll_percent:.1f}%) → actual: {u_ll_actual:,}")
+        print(f"  V Channel LL: {v_budget:,} ({v_ll_percent:.1f}%) → actual: {v_ll_actual:,}")
+        print(f"  Total LL actual: {total_ll_actual:,} ({100*total_ll_actual/TOTAL_PARAM_BUDGET:.1f}% efficiency)")
+    else:
+        print(f"  Y Channel: {int(TOTAL_PARAM_BUDGET * Y_BUDGET_PERCENT):,} ({100*Y_BUDGET_PERCENT:.1f}%) = LL {y_budget:,} ({y_ll_percent:.1f}%) + HF {y_hf_budget:,} ({100*Y_HF_BUDGET_PERCENT:.1f}%)")
+        print(f"  U Channel: {int(TOTAL_PARAM_BUDGET * U_BUDGET_PERCENT):,} ({100*U_BUDGET_PERCENT:.1f}%) = LL {u_budget:,} ({u_ll_percent:.1f}%) + HF {u_hf_budget:,} ({100*U_HF_BUDGET_PERCENT:.1f}%)")
+        print(f"  V Channel: {int(TOTAL_PARAM_BUDGET * V_BUDGET_PERCENT):,} ({100*V_BUDGET_PERCENT:.1f}%) = LL {v_budget:,} ({v_ll_percent:.1f}%) + HF {v_hf_budget:,} ({100*V_HF_BUDGET_PERCENT:.1f}%)")
     
     # Train models for each band individually with PSNR after each
     start_time = time.time()
@@ -971,6 +1087,7 @@ def main():
     
     # Helper function to reconstruct and calc PSNR after each band
     band_psnrs = []  # Track PSNR after each band
+    band_resource_usage = []  # Track per-band timing and memory usage
     def reconstruct_and_calc_psnr(band_desc):
         # Reconstruct channels
         y_rec_coeffs = reconstruct_channel_from_models(y_models, y_coeffs, device) if y_models else None
@@ -1034,14 +1151,54 @@ def main():
     print(f"{'='*70}")
     
     # Train each band and reconstruct after each
+    cuda_available = torch.cuda.is_available()
     for idx, (ch_name, ch_data, ch_coeffs, budget, hf_budget, band_name) in enumerate(all_bands, 1):
-        print(f"\n[{idx}/21] Training {ch_name}-{band_name}...")
+        band_desc = f"{ch_name}-{band_name}"
+        print(f"\n[{idx}/21] Training {band_desc}...")
+
+        # Capture memory at start of training
+        start_mem = None
+        if cuda_available:
+            torch.cuda.synchronize()
+            start_mem = get_memory_stats(device='cuda')
+        
+        # Track training time for this band
+        band_start_time = time.time()
         
         # Train this specific band
         new_models = train_channel_dwt_models(
             ch_data, ch_coeffs, ch_name, budget, hf_budget, device, 
             train_only_band=band_name
         )
+        
+        if cuda_available:
+            torch.cuda.synchronize()
+
+        band_train_time = time.time() - band_start_time
+        print(f"  Training time: {band_train_time:.2f} seconds")
+
+        # Capture memory at end of training and calculate growth
+        end_mem = get_memory_stats(device='cuda' if cuda_available else 'cpu')
+        if end_mem is not None and start_mem is not None:
+            mem_growth = end_mem['current_allocated_mb'] - start_mem['current_allocated_mb']
+            print(f"  Memory Growth: {mem_growth:.2f} MB")
+        else:
+            mem_growth = None
+            print(f"  Memory Growth: (Unable to measure)")
+        
+        # Calculate and show parameter size
+        if new_models:
+            band_params = sum(info['params'] for info in new_models.values())
+            band_params_kb = (band_params * 2) / 1024  # FP16 = 2 bytes per param
+            print(f"  Parameters: {band_params:,} ({band_params_kb:.2f} KB)")
+
+        band_resource_usage.append({
+            'band': band_desc,
+            'train_time_seconds': round(band_train_time, 4),
+            'memory_growth_mb': round(mem_growth, 2) if mem_growth is not None else None,
+            'start_allocated_mb': round(start_mem['current_allocated_mb'], 2) if start_mem else None,
+            'end_allocated_mb': round(end_mem['current_allocated_mb'], 2) if end_mem else None,
+        })
         
         # Update the appropriate model dict
         if ch_name == 'Y':
@@ -1052,9 +1209,33 @@ def main():
             v_models.update(new_models)
         
         # Reconstruct and show PSNR
-        reconstruct_and_calc_psnr(f"{ch_name}-{band_name}")
+        reconstruct_and_calc_psnr(band_desc)
     
     train_time = time.time() - start_time
+    
+    # Calculate actual total parameters
+    actual_params_y = sum(info['params'] for info in y_models.values())
+    actual_params_u = sum(info['params'] for info in u_models.values())
+    actual_params_v = sum(info['params'] for info in v_models.values())
+    total_actual_params = actual_params_y + actual_params_u + actual_params_v
+    
+    # Reconstruct final image and save it
+    print(f"\nReconstructing final image...")
+    y_rec_coeffs = reconstruct_channel_from_models(y_models, y_coeffs, device)
+    u_rec_coeffs = reconstruct_channel_from_models(u_models, u_coeffs, device)
+    v_rec_coeffs = reconstruct_channel_from_models(v_models, v_coeffs, device)
+    
+    y_rec = pywt.waverec2(y_rec_coeffs, WAVELET)[:orig_h, :orig_w]
+    u_rec = pywt.waverec2(u_rec_coeffs, WAVELET)[:orig_h, :orig_w]
+    v_rec = pywt.waverec2(v_rec_coeffs, WAVELET)[:orig_h, :orig_w]
+    
+    yuv_rec = np.stack([y_rec, u_rec, v_rec], axis=2)
+    rgb_rec = yuv_to_rgb(yuv_rec)
+    
+    # Save reconstructed image
+    reconstructed_img_path = os.path.join(LOG_DIR, f"{IMAGEID}_reconstructed.png")
+    Image.fromarray(rgb_rec).save(reconstructed_img_path)
+    print(f"Saved reconstructed image to: {reconstructed_img_path}")
     
     # Calculate actual total parameters
     actual_params_y = sum(info['params'] for info in y_models.values())
@@ -1073,7 +1254,7 @@ def main():
     print(f"{'='*70}")
     
     # Save models and calculate size
-    print("\nSaving models...")
+    print("\nSaving models (converted to FP16 for storage)...")
     models_dir = os.path.join(LOG_DIR, "models")
     os.makedirs(models_dir, exist_ok=True)
     
@@ -1082,26 +1263,53 @@ def main():
     # Save Y channel models
     for band_name, info in y_models.items():
         model_path = os.path.join(models_dir, f"y_{band_name.lower()}_model.pt")
-        torch.save(info['model'].state_dict(), model_path)
+        # Convert to FP16 for storage (like in main.py)
+        model_fp16 = {k: v.half() if v.dtype in [torch.float32, torch.float64] else v 
+                      for k, v in info['model'].state_dict().items()}
+        torch.save(model_fp16, model_path)
         model_size = os.path.getsize(model_path)
+        model_size_kb = model_size / 1024
+        params = info['params']
+        pure_param_size_bytes = params * 2  # FP16 = 2 bytes per param
+        pure_param_size_kb = pure_param_size_bytes / 1024
+        overhead_bytes = model_size - pure_param_size_bytes
+        overhead_pct = (overhead_bytes / model_size * 100) if model_size > 0 else 0
         total_model_size_bytes += model_size
-        print(f"  Y {band_name}: {model_size:,} bytes")
+        print(f"  Y {band_name}: {model_size_kb:.2f} KB (params: {pure_param_size_kb:.2f} KB, overhead: {overhead_bytes/1024:.2f} KB, {overhead_pct:.1f}%)")
     
     # Save U channel models
     for band_name, info in u_models.items():
         model_path = os.path.join(models_dir, f"u_{band_name.lower()}_model.pt")
-        torch.save(info['model'].state_dict(), model_path)
+        # Convert to FP16 for storage (like in main.py)
+        model_fp16 = {k: v.half() if v.dtype in [torch.float32, torch.float64] else v 
+                      for k, v in info['model'].state_dict().items()}
+        torch.save(model_fp16, model_path)
         model_size = os.path.getsize(model_path)
+        model_size_kb = model_size / 1024
+        params = info['params']
+        pure_param_size_bytes = params * 2  # FP16 = 2 bytes per param
+        pure_param_size_kb = pure_param_size_bytes / 1024
+        overhead_bytes = model_size - pure_param_size_bytes
+        overhead_pct = (overhead_bytes / model_size * 100) if model_size > 0 else 0
         total_model_size_bytes += model_size
-        print(f"  U {band_name}: {model_size:,} bytes")
+        print(f"  U {band_name}: {model_size_kb:.2f} KB (params: {pure_param_size_kb:.2f} KB, overhead: {overhead_bytes/1024:.2f} KB, {overhead_pct:.1f}%)")
     
     # Save V channel models
     for band_name, info in v_models.items():
         model_path = os.path.join(models_dir, f"v_{band_name.lower()}_model.pt")
-        torch.save(info['model'].state_dict(), model_path)
+        # Convert to FP16 for storage (like in main.py)
+        model_fp16 = {k: v.half() if v.dtype in [torch.float32, torch.float64] else v 
+                      for k, v in info['model'].state_dict().items()}
+        torch.save(model_fp16, model_path)
         model_size = os.path.getsize(model_path)
+        model_size_kb = model_size / 1024
+        params = info['params']
+        pure_param_size_bytes = params * 2  # FP16 = 2 bytes per param
+        pure_param_size_kb = pure_param_size_bytes / 1024
+        overhead_bytes = model_size - pure_param_size_bytes
+        overhead_pct = (overhead_bytes / model_size * 100) if model_size > 0 else 0
         total_model_size_bytes += model_size
-        print(f"  V {band_name}: {model_size:,} bytes")
+        print(f"  V {band_name}: {model_size_kb:.2f} KB (params: {pure_param_size_kb:.2f} KB, overhead: {overhead_bytes/1024:.2f} KB, {overhead_pct:.1f}%)")
     
     total_model_size_kb = total_model_size_bytes / 1024
     total_model_size_mb = total_model_size_kb / 1024
@@ -1124,6 +1332,7 @@ def main():
     final_psnr = band_psnrs[-1] if band_psnrs else {'y': 0, 'u': 0, 'v': 0, 'rgb': 0}
     results = {
         'image_id': IMAGEID,
+        'reconstructed_image': reconstructed_img_path,
         'total_params': total_actual_params,
         'params_y': actual_params_y,
         'params_u': actual_params_u,
@@ -1134,6 +1343,7 @@ def main():
         'v_psnr': final_psnr['v'],
         'rgb_psnr': final_psnr['rgb'],
         'band_psnrs': band_psnrs,  # PSNR after each of 21 bands
+        'band_resource_usage': band_resource_usage,
         'train_time': train_time,
         'levels': LEVELS,
         'wavelet': WAVELET,
@@ -1155,6 +1365,14 @@ def main():
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"Saved results to: {results_path}")
+    
+    # Log final resource statistics
+    print_memory_stats("Memory at script end", device='cuda' if torch.cuda.is_available() else 'cpu')
+    monitor.print_summary()
+    
+    # Save resource summary
+    resource_summary_path = os.path.join(LOG_DIR, f"{IMAGEID}_resource_summary.json")
+    monitor.save_summary(resource_summary_path)
 
 if __name__ == "__main__":
     main()
