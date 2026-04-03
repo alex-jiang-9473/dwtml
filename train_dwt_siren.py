@@ -26,19 +26,12 @@ from experiment_config import (
     MODEL_DIR,
     SKIP_HF_TRAINING,
     THRESHOLD_FACTOR,
-    TOTAL_PARAM_BUDGET,
     TRAIN_HF_BANDS,
     build_band_checkpoint_name,
     format_band_config,
     get_candidate_configs,
     get_filter_threshold,
-    U_BUDGET_PERCENT,
-    U_HF_BUDGET_PERCENT,
-    V_BUDGET_PERCENT,
-    V_HF_BUDGET_PERCENT,
     WAVELET,
-    Y_BUDGET_PERCENT,
-    Y_HF_BUDGET_PERCENT,
 )
 from dwt_siren_common import (
     calculate_iterations_for_params,
@@ -477,7 +470,6 @@ def main():
     print(f"\n{'='*70}")
     print("TRAINING CONFIGURATION")
     print(f"{'='*70}")
-    print(f"Reference budget: {TOTAL_PARAM_BUDGET:,} parameters")
     print(f"Compare configs: {COMPARE_CONFIGS}")
     print(f"HF training: {TRAIN_HF_BANDS}")
     for channel_name, tasks in channel_tasks.items():
@@ -489,7 +481,6 @@ def main():
         'wavelet': WAVELET,
         'compare_configs': COMPARE_CONFIGS,
         'train_hf_bands': TRAIN_HF_BANDS,
-        'reference_total_param_budget': TOTAL_PARAM_BUDGET,
         'bands': {},
         'channels': {},
     }

@@ -9,6 +9,7 @@ import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import json
+from itertools import product
 import numpy as np
 import pywt
 import torch
@@ -20,6 +21,13 @@ from dwt_siren_common import (
     rgb_to_yuv,
     yuv_to_rgb,
 )
+
+
+# Evaluate every checkpoint combination across all sub-bands.
+MAX_COMBINATIONS = 10  # Cap runtime by sampling this many combinations.
+SAMPLE_RANDOM_COMBINATIONS = True
+RANDOM_SAMPLE_SEED = 2
+SAVE_COMBINATION_IMAGES = True
 
 # ============================================================================== 
 # UTILITIES
@@ -88,6 +96,171 @@ def load_training_manifest(model_dir):
 
     with open(manifest_path, 'r') as f:
         return json.load(f)
+
+
+def resolve_checkpoint_path(checkpoint_path):
+    """Resolve checkpoint path relative to current workspace if needed."""
+    if checkpoint_path is None:
+        return None
+    if os.path.isabs(checkpoint_path):
+        return checkpoint_path
+    return os.path.abspath(checkpoint_path)
+
+
+def calculate_checkpoint_sizes(checkpoint_path, checkpoint_dict):
+    """Calculate checkpoint file size in KB and FP16 parameter size in KB.
+    
+    Returns:
+        (file_size_kb, param_size_fp16_kb) or (None, None) if checkpoint is None
+    """
+    if checkpoint_path is None:
+        return None, None
+
+    file_size_kb = os.path.getsize(checkpoint_path) / 1024.0
+
+    param_count = checkpoint_dict.get('params')
+    if param_count is None:
+        state_dict = checkpoint_dict.get('state_dict', {})
+        param_count = sum(p.numel() for p in state_dict.values() if hasattr(p, 'numel'))
+
+    fp16_size_kb = (param_count * 2) / 1024.0 if param_count else None
+
+    return file_size_kb, fp16_size_kb
+
+
+def load_band_options(channel_name, band_name, band_shape, manifest, device='cuda'):
+    """Load all available candidate checkpoints for one band and precompute coefficients."""
+    band_key = f'{channel_name}_{band_name}'
+    band_records = manifest.get('bands', {})
+    band_record = band_records.get(band_key)
+
+    if band_record is None:
+        if band_name == 'LL':
+            raise ValueError(f'LL band record missing in manifest for {channel_name}')
+        return [{
+            'band_key': band_key,
+            'option_id': f'{band_key}_zeros',
+            'checkpoint_path': None,
+            'config_label': 'zeros',
+            'training_psnr': None,
+            'is_best': False,
+            'coeffs': np.zeros(band_shape, dtype=np.float32),
+        }]
+
+    raw_candidates = band_record.get('candidates', [])
+    if raw_candidates:
+        option_sources = raw_candidates
+    else:
+        best_path = band_record.get('best_checkpoint')
+        option_sources = [{
+            'checkpoint_path': best_path,
+            'config_label': band_record.get('best_config_label', 'best_model'),
+            'training_psnr': band_record.get('best_training_psnr'),
+        }]
+
+    best_checkpoint_abs = resolve_checkpoint_path(band_record.get('best_checkpoint'))
+    options = []
+
+    for idx, candidate in enumerate(option_sources):
+        checkpoint_path = resolve_checkpoint_path(candidate.get('checkpoint_path'))
+        if not checkpoint_path or not os.path.exists(checkpoint_path):
+            continue
+
+        model, checkpoint = load_siren_checkpoint(checkpoint_path, device)
+        coeffs = reconstruct_band_from_model(
+            model,
+            checkpoint,
+            tuple(checkpoint['shape']),
+            checkpoint.get('sparse_mask'),
+            device,
+        )
+
+        file_size_kb, param_size_fp16_kb = calculate_checkpoint_sizes(checkpoint_path, checkpoint)
+
+        options.append({
+            'band_key': band_key,
+            'option_id': f'{band_key}_{idx}',
+            'checkpoint_path': checkpoint_path,
+            'config_label': candidate.get('config_label', 'unknown'),
+            'training_psnr': candidate.get('training_psnr'),
+            'is_best': checkpoint_path == best_checkpoint_abs,
+            'checkpoint_file_size_kb': file_size_kb,
+            'param_size_fp16_kb': param_size_fp16_kb,
+            'coeffs': coeffs,
+        })
+
+    if not options:
+        if band_name == 'LL':
+            raise ValueError(f'No valid LL checkpoints found for {band_key}')
+        options.append({
+            'band_key': band_key,
+            'option_id': f'{band_key}_zeros',
+            'checkpoint_path': None,
+            'config_label': 'zeros',
+            'training_psnr': None,
+            'is_best': False,
+            'coeffs': np.zeros(band_shape, dtype=np.float32),
+        })
+
+    return options
+
+
+def build_combination_axes(manifest, y_coeffs_orig, u_coeffs_orig, v_coeffs_orig, device='cuda'):
+    """Build all per-band option axes for Cartesian product reconstruction."""
+    channel_coeffs = {
+        'Y': y_coeffs_orig,
+        'U': u_coeffs_orig,
+        'V': v_coeffs_orig,
+    }
+
+    axes = []
+    for channel_name in ['Y', 'U', 'V']:
+        coeffs = channel_coeffs[channel_name]
+        ll_shape = coeffs[0].shape
+        axes.append({
+            'channel': channel_name,
+            'band_name': 'LL',
+            'options': load_band_options(channel_name, 'LL', ll_shape, manifest, device),
+        })
+
+        for level_idx in range(1, LEVELS + 1):
+            cH_shape = coeffs[level_idx][0].shape
+            for dir_name in ['cH', 'cV', 'cD']:
+                band_name = f'{dir_name}_L{level_idx}'
+                axes.append({
+                    'channel': channel_name,
+                    'band_name': band_name,
+                    'options': load_band_options(channel_name, band_name, cH_shape, manifest, device),
+                })
+
+    return axes
+
+
+def build_channel_coeffs_from_selection(original_coeffs, selected_options):
+    """Assemble [LL, (cH,cV,cD), ...] coefficients from selected option objects."""
+    coeffs_reconstructed = [selected_options['LL']['coeffs']]
+    for level_idx in range(1, LEVELS + 1):
+        hf = selected_options[f'cH_L{level_idx}']['coeffs']
+        vf = selected_options[f'cV_L{level_idx}']['coeffs']
+        df = selected_options[f'cD_L{level_idx}']['coeffs']
+        coeffs_reconstructed.append((hf, vf, df))
+    return coeffs_reconstructed
+
+
+def sample_option_index_tuples(axis_sizes, sample_count, seed):
+    """Sample unique option-index tuples without enumerating the full Cartesian product."""
+    rng = np.random.default_rng(seed)
+    sampled = set()
+    sampled_list = []
+
+    while len(sampled_list) < sample_count:
+        idx_tuple = tuple(int(rng.integers(0, size)) for size in axis_sizes)
+        if idx_tuple in sampled:
+            continue
+        sampled.add(idx_tuple)
+        sampled_list.append(idx_tuple)
+
+    return sampled_list
 
 
 def reconstruct_channel_from_manifest(channel_name, original_coeffs, manifest, device='cuda'):
@@ -188,60 +361,276 @@ def main():
     print(f"\nLoaded training manifest with {len(manifest.get('bands', {}))} trained bands")
     print(f"Compare configs: {manifest.get('compare_configs', False)}")
     print(f"HF training: {manifest.get('train_hf_bands', False)}")
-    
-    # Reconstruct channels
+
     print(f"\n{'='*70}")
-    print("Reconstructing Y channel...")
-    y_coeffs_rec = reconstruct_channel_from_manifest('Y', y_coeffs_orig, manifest, device)
-    
-    print(f"Reconstructing U channel...")
-    u_coeffs_rec = reconstruct_channel_from_manifest('U', u_coeffs_orig, manifest, device)
-    
-    print(f"Reconstructing V channel...")
-    v_coeffs_rec = reconstruct_channel_from_manifest('V', v_coeffs_orig, manifest, device)
-    
-    # Inverse DWT
-    print(f"\nPerforming inverse DWT...")
-    y_rec = pywt.waverec2(y_coeffs_rec, WAVELET)[:orig_h, :orig_w]
-    u_rec = pywt.waverec2(u_coeffs_rec, WAVELET)[:orig_h, :orig_w]
-    v_rec = pywt.waverec2(v_coeffs_rec, WAVELET)[:orig_h, :orig_w]
-    
-    # YUV to RGB
-    yuv_rec = np.stack([y_rec, u_rec, v_rec], axis=2)
-    rgb_rec = yuv_to_rgb(yuv_rec)
-    
-    # Save reconstructed image
-    output_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_reconstructed.png")
-    img_rec = Image.fromarray(rgb_rec)
-    img_rec.save(output_path)
-    print(f"\n✓ Saved to: {output_path}")
-    
-    # Calculate quality metrics
-    y_psnr = util.get_clamped_psnr(
+    print("LOADING SUB-BAND OPTIONS")
+    print(f"{'='*70}")
+    axes = build_combination_axes(manifest, y_coeffs_orig, u_coeffs_orig, v_coeffs_orig, device)
+
+    total_combinations = 1
+    for axis in axes:
+        option_count = len(axis['options'])
+        total_combinations *= option_count
+        print(f"{axis['channel']}_{axis['band_name']}: {option_count} options")
+
+    if MAX_COMBINATIONS is None:
+        combinations_to_run = total_combinations
+    else:
+        combinations_to_run = min(total_combinations, MAX_COMBINATIONS)
+
+    print(f"\nTotal combinations: {total_combinations:,}")
+    if MAX_COMBINATIONS is not None and total_combinations > MAX_COMBINATIONS:
+        print(f"Running capped subset: {combinations_to_run:,}")
+
+    combinations_dir = os.path.join(OUTPUT_DIR, f"{IMAGEID}_combo_images")
+    if SAVE_COMBINATION_IMAGES:
+        os.makedirs(combinations_dir, exist_ok=True)
+
+    all_results = []
+    best_result = None
+    worst_result = None
+    best_rgb_rec = None
+    worst_rgb_rec = None
+
+    axis_sizes = [len(axis['options']) for axis in axes]
+    if (
+        SAMPLE_RANDOM_COMBINATIONS
+        and MAX_COMBINATIONS is not None
+        and total_combinations > combinations_to_run
+    ):
+        option_index_sequences = sample_option_index_tuples(
+            axis_sizes,
+            combinations_to_run,
+            RANDOM_SAMPLE_SEED,
+        )
+        print(f"Sampling mode: random ({combinations_to_run:,} combinations, seed={RANDOM_SAMPLE_SEED})")
+    else:
+        index_ranges = [range(size) for size in axis_sizes]
+        option_index_sequences = product(*index_ranges)
+        if MAX_COMBINATIONS is None:
+            print("Sampling mode: exhaustive")
+        else:
+            print(f"Sampling mode: first {combinations_to_run:,} combinations")
+
+    for combo_idx, option_indices in enumerate(option_index_sequences):
+        if MAX_COMBINATIONS is not None and combo_idx >= combinations_to_run:
+            break
+
+        selected_by_channel = {
+            'Y': {},
+            'U': {},
+            'V': {},
+        }
+        selection_log = []
+        total_checkpoint_file_size_kb = 0.0
+        total_param_size_fp16_kb = 0.0
+
+        for axis, opt_idx in zip(axes, option_indices):
+            selected = axis['options'][opt_idx]
+            selected_by_channel[axis['channel']][axis['band_name']] = selected
+            selection_log.append({
+                'band_key': selected['band_key'],
+                'option_id': selected['option_id'],
+                'config_label': selected['config_label'],
+                'checkpoint_path': selected['checkpoint_path'],
+                'training_psnr': selected['training_psnr'],
+                'is_best': selected['is_best'],
+                'checkpoint_file_size_kb': selected.get('checkpoint_file_size_kb'),
+                'param_size_fp16_kb': selected.get('param_size_fp16_kb'),
+            })
+
+            checkpoint_size = selected.get('checkpoint_file_size_kb')
+            if checkpoint_size is not None:
+                total_checkpoint_file_size_kb += float(checkpoint_size)
+
+            fp16_size = selected.get('param_size_fp16_kb')
+            if fp16_size is not None:
+                total_param_size_fp16_kb += float(fp16_size)
+
+        y_coeffs_rec = build_channel_coeffs_from_selection(y_coeffs_orig, selected_by_channel['Y'])
+        u_coeffs_rec = build_channel_coeffs_from_selection(u_coeffs_orig, selected_by_channel['U'])
+        v_coeffs_rec = build_channel_coeffs_from_selection(v_coeffs_orig, selected_by_channel['V'])
+
+        y_rec = pywt.waverec2(y_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+        u_rec = pywt.waverec2(u_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+        v_rec = pywt.waverec2(v_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+
+        yuv_rec = np.stack([y_rec, u_rec, v_rec], axis=2)
+        rgb_rec = yuv_to_rgb(yuv_rec)
+
+        image_path = None
+        if SAVE_COMBINATION_IMAGES:
+            image_path = os.path.join(combinations_dir, f"{IMAGEID}_combo_{combo_idx:06d}.png")
+            Image.fromarray(rgb_rec).save(image_path)
+
+        y_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(y_channel.flatten()),
+            torch.FloatTensor(y_rec.flatten())
+        )
+        u_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(u_channel.flatten()),
+            torch.FloatTensor(u_rec.flatten())
+        )
+        v_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(v_channel.flatten()),
+            torch.FloatTensor(v_rec.flatten())
+        )
+        rgb_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(np.array(img_rgb).flatten()),
+            torch.FloatTensor(rgb_rec.flatten())
+        )
+
+        result = {
+            'combo_index': combo_idx,
+            'image_path': image_path,
+            'metrics': {
+                'y_psnr': float(y_psnr),
+                'u_psnr': float(u_psnr),
+                'v_psnr': float(v_psnr),
+                'rgb_psnr': float(rgb_psnr),
+            },
+            'total_checkpoint_file_size_kb': float(total_checkpoint_file_size_kb),
+            'total_param_size_fp16_kb': float(total_param_size_fp16_kb),
+            'selected_sub_bands': selection_log,
+        }
+        all_results.append(result)
+
+        if best_result is None or result['metrics']['rgb_psnr'] > best_result['metrics']['rgb_psnr']:
+            best_result = result
+            best_rgb_rec = rgb_rec.copy()
+
+        if worst_result is None or result['metrics']['rgb_psnr'] < worst_result['metrics']['rgb_psnr']:
+            worst_result = result
+            worst_rgb_rec = rgb_rec.copy()
+
+        if (combo_idx + 1) % 25 == 0 or combo_idx + 1 == combinations_to_run:
+            print(f"Processed {combo_idx + 1:,}/{combinations_to_run:,} combinations")
+
+    print(f"\nBuilding best-per-band reconstruction from training PSNR...")
+    best_per_band_result = None
+    best_per_band_rgb = None
+    best_per_band_config = []
+
+    selected_best_per_band = {'Y': {}, 'U': {}, 'V': {}}
+    for axis in axes:
+        if not axis['options']:
+            continue
+        best_option = max(
+            axis['options'],
+            key=lambda opt: opt.get('training_psnr') or -float('inf')
+        )
+        selected_best_per_band[axis['channel']][axis['band_name']] = best_option
+        best_per_band_config.append({
+            'band_key': best_option['band_key'],
+            'config_label': best_option['config_label'],
+            'training_psnr': best_option.get('training_psnr'),
+        })
+
+    y_coeffs_best = build_channel_coeffs_from_selection(y_coeffs_orig, selected_best_per_band['Y'])
+    u_coeffs_best = build_channel_coeffs_from_selection(u_coeffs_orig, selected_best_per_band['U'])
+    v_coeffs_best = build_channel_coeffs_from_selection(v_coeffs_orig, selected_best_per_band['V'])
+
+    y_rec_best = pywt.waverec2(y_coeffs_best, WAVELET)[:orig_h, :orig_w]
+    u_rec_best = pywt.waverec2(u_coeffs_best, WAVELET)[:orig_h, :orig_w]
+    v_rec_best = pywt.waverec2(v_coeffs_best, WAVELET)[:orig_h, :orig_w]
+
+    yuv_rec_best = np.stack([y_rec_best, u_rec_best, v_rec_best], axis=2)
+    rgb_rec_best = yuv_to_rgb(yuv_rec_best)
+    best_per_band_rgb = rgb_rec_best.copy()
+
+    y_psnr_best = util.get_clamped_psnr(
         torch.FloatTensor(y_channel.flatten()),
-        torch.FloatTensor(y_rec.flatten())
+        torch.FloatTensor(y_rec_best.flatten())
     )
-    u_psnr = util.get_clamped_psnr(
+    u_psnr_best = util.get_clamped_psnr(
         torch.FloatTensor(u_channel.flatten()),
-        torch.FloatTensor(u_rec.flatten())
+        torch.FloatTensor(u_rec_best.flatten())
     )
-    v_psnr = util.get_clamped_psnr(
+    v_psnr_best = util.get_clamped_psnr(
         torch.FloatTensor(v_channel.flatten()),
-        torch.FloatTensor(v_rec.flatten())
+        torch.FloatTensor(v_rec_best.flatten())
     )
-    rgb_psnr = util.get_clamped_psnr(
+    rgb_psnr_best = util.get_clamped_psnr(
         torch.FloatTensor(np.array(img_rgb).flatten()),
-        torch.FloatTensor(rgb_rec.flatten())
+        torch.FloatTensor(rgb_rec_best.flatten())
     )
-    
+
+    best_per_band_result = {
+        'reconstruction_type': 'best_per_band',
+        'metrics': {
+            'y_psnr': float(y_psnr_best),
+            'u_psnr': float(u_psnr_best),
+            'v_psnr': float(v_psnr_best),
+            'rgb_psnr': float(rgb_psnr_best),
+        },
+        'selected_sub_bands': best_per_band_config,
+    }
+
+    log_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_combination_log.json")
+    best_image_path = None
+    worst_image_path = None
+    best_per_band_path = None
+
+    if best_result is not None and best_rgb_rec is not None:
+        best_image_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_best_combination.png")
+        Image.fromarray(best_rgb_rec).save(best_image_path)
+
+    if worst_result is not None and worst_rgb_rec is not None:
+        worst_image_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_worst_combination.png")
+        Image.fromarray(worst_rgb_rec).save(worst_image_path)
+
+    if best_per_band_rgb is not None:
+        best_per_band_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_reconstructed_best.png")
+        Image.fromarray(best_per_band_rgb).save(best_per_band_path)
+
+    summary = {
+        'image_id': IMAGEID,
+        'levels': LEVELS,
+        'wavelet': WAVELET,
+        'total_combinations_available': total_combinations,
+        'total_combinations_evaluated': len(all_results),
+        'max_combinations_cap': MAX_COMBINATIONS,
+        'sample_random_combinations': SAMPLE_RANDOM_COMBINATIONS,
+        'random_sample_seed': RANDOM_SAMPLE_SEED,
+        'save_combination_images': SAVE_COMBINATION_IMAGES,
+        'best_combination': {
+            'image_path': best_image_path,
+            'result': best_result,
+        },
+        'worst_combination': {
+            'image_path': worst_image_path,
+            'result': worst_result,
+        },
+        'best_per_band_training': {
+            'image_path': best_per_band_path,
+            'result': best_per_band_result,
+        },
+        'results': all_results,
+    }
+    with open(log_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
     print(f"\n{'='*70}")
-    print("RECONSTRUCTION QUALITY")
+    print("COMBINATION EVALUATION COMPLETE")
     print(f"{'='*70}")
-    print(f"Y PSNR:  {y_psnr:.2f} dB")
-    print(f"U PSNR:  {u_psnr:.2f} dB")
-    print(f"V PSNR:  {v_psnr:.2f} dB")
-    print(f"RGB PSNR: {rgb_psnr:.2f} dB")
-    print(f"{'='*70}")
+    print(f"Combination log saved to: {log_path}\n")
+
+    if best_per_band_result is not None:
+        print(f"BEST PER-BAND (from training PSNR):")
+        print(f"  Image: {best_per_band_path}")
+        print(f"  RGB PSNR: {best_per_band_result['metrics']['rgb_psnr']:.2f} dB\n")
+
+    if best_result is not None:
+        print(f"BEST COMBINATION (from {combinations_to_run:,} samples):")
+        print(f"  Index: {best_result['combo_index']}")
+        print(f"  Image: {best_image_path}")
+        print(f"  RGB PSNR: {best_result['metrics']['rgb_psnr']:.2f} dB\n")
+
+    if worst_result is not None:
+        print(f"WORST COMBINATION (from {combinations_to_run:,} samples):")
+        print(f"  Index: {worst_result['combo_index']}")
+        print(f"  Image: {worst_image_path}")
+        print(f"  RGB PSNR: {worst_result['metrics']['rgb_psnr']:.2f} dB")
 
 if __name__ == "__main__":
     main()
