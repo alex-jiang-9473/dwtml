@@ -341,28 +341,6 @@ def train_band_candidate(task, config, device, output_dir):
 
     checkpoint = {
         'state_dict': model.state_dict(),
-        'config': config.to_dict(),
-        'channel_name': task['channel_name'],
-        'band_name': task['band_name'],
-        'band_id': task['band_id'],
-        'role': task['role'],
-        'shape': tuple(task['shape']),
-        'sparse_mask': task['sparse_mask'],
-        'coeff_mean': np.asarray(coeff_mean),
-        'coeff_std': np.asarray(coeff_std),
-        'mean': np.asarray(coeff_mean),
-        'std': np.asarray(coeff_std),
-        'layers': config.layers,
-        'hidden_size': config.hidden_size,
-        'iterations': config.iterations,
-        'lr': config.lr,
-        'w0': config.w0,
-        'dim_in': coords.shape[1],
-        'dim_out': 1,
-        'num_coeffs': int(values_array.size),
-        'training_psnr': float(psnr),
-        'training_time_sec': float(training_time),
-        'memory_peak_mb': None if mem_peak is None else float(mem_peak),
     }
 
     checkpoint_name = build_band_checkpoint_name(task['channel_name'], task['band_name'], config)
@@ -379,6 +357,17 @@ def train_band_candidate(task, config, device, output_dir):
         'checkpoint_name': checkpoint_name,
         'params': calculate_model_params(config.layers, config.hidden_size, dim_in=coords.shape[1], dim_out=1),
         'num_coeffs': int(values_array.size),
+        'band_metadata': {
+            'channel_name': task['channel_name'],
+            'band_name': task['band_name'],
+            'band_id': task['band_id'],
+            'shape': tuple(task['shape']),
+            'sparse_mask': task['sparse_mask'],
+            'coeff_mean': np.asarray(coeff_mean),
+            'coeff_std': np.asarray(coeff_std),
+            'dim_in': coords.shape[1],
+            'dim_out': 1,
+        },
     }
 
 
@@ -398,16 +387,24 @@ def train_band_experiments(task, device):
     print(f"{'='*70}")
 
     candidate_results = []
+    band_metadata = None
     for config in candidate_configs:
         print(f"\n→ Config {format_band_config(config)} | lr={config.lr:.1e}")
         result = train_band_candidate(task, config, device, band_dir)
+        if band_metadata is None:
+            band_metadata = result.pop('band_metadata')
+        else:
+            result.pop('band_metadata', None)
         candidate_results.append(result)
 
     best_result = max(candidate_results, key=lambda item: item['training_psnr'])
-    best_checkpoint = torch.load(best_result['checkpoint_path'], map_location='cpu', weights_only=False)
-    best_checkpoint['is_best'] = True
-    best_checkpoint['selected_from'] = [item['checkpoint_name'] for item in candidate_results]
 
+    if band_metadata is None:
+        raise ValueError(f"Band metadata missing for {task['band_id']}")
+    band_metadata_path = os.path.join(band_dir, 'band_metadata.pt')
+    torch.save(band_metadata, band_metadata_path)
+
+    best_checkpoint = torch.load(best_result['checkpoint_path'], map_location='cpu', weights_only=False)
     best_checkpoint_path = os.path.join(band_dir, 'best_model.pt')
     torch.save(best_checkpoint, best_checkpoint_path)
 
@@ -420,6 +417,7 @@ def train_band_experiments(task, device):
         'dense': task['dense'],
         'candidate_count': len(candidate_results),
         'candidates': candidate_results,
+        'band_metadata_path': band_metadata_path,
         'best_checkpoint': best_checkpoint_path,
         'best_config': best_result['config'],
         'best_config_label': best_result['config_label'],

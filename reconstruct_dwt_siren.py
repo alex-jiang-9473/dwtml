@@ -16,6 +16,7 @@ import torch
 from PIL import Image
 import util
 from experiment_config import IMAGEID, LEVELS, MODEL_DIR, OUTPUT_DIR, WAVELET
+from siren import Siren
 from dwt_siren_common import (
     load_siren_checkpoint,
     rgb_to_yuv,
@@ -118,9 +119,14 @@ def calculate_checkpoint_sizes(checkpoint_path, checkpoint_dict):
 
     file_size_kb = os.path.getsize(checkpoint_path) / 1024.0
 
-    param_count = checkpoint_dict.get('params')
+    param_count = checkpoint_dict.get('params') if isinstance(checkpoint_dict, dict) else None
     if param_count is None:
-        state_dict = checkpoint_dict.get('state_dict', {})
+        if isinstance(checkpoint_dict, dict) and 'state_dict' in checkpoint_dict:
+            state_dict = checkpoint_dict['state_dict']
+        elif isinstance(checkpoint_dict, dict):
+            state_dict = checkpoint_dict
+        else:
+            state_dict = {}
         param_count = sum(p.numel() for p in state_dict.values() if hasattr(p, 'numel'))
 
     fp16_size_kb = (param_count * 2) / 1024.0 if param_count else None
@@ -158,6 +164,13 @@ def load_band_options(channel_name, band_name, band_shape, manifest, device='cud
             'training_psnr': band_record.get('best_training_psnr'),
         }]
 
+    metadata_path = band_record.get('band_metadata_path')
+    band_metadata = None
+    if metadata_path:
+        metadata_path = resolve_checkpoint_path(metadata_path)
+        if metadata_path and os.path.exists(metadata_path):
+            band_metadata = torch.load(metadata_path, map_location='cpu', weights_only=False)
+
     best_checkpoint_abs = resolve_checkpoint_path(band_record.get('best_checkpoint'))
     options = []
 
@@ -166,22 +179,78 @@ def load_band_options(channel_name, band_name, band_shape, manifest, device='cud
         if not checkpoint_path or not os.path.exists(checkpoint_path):
             continue
 
-        model, checkpoint = load_siren_checkpoint(checkpoint_path, device)
+        checkpoint_raw = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        if band_metadata is not None:
+            config = candidate.get('config', {})
+            layers = config.get('layers')
+            hidden_size = config.get('hidden_size')
+            if layers is None or hidden_size is None:
+                raise ValueError(f"Config missing layers/hidden_size for {band_key} candidate {idx}")
+
+            dim_in = int(band_metadata.get('dim_in', 2))
+            dim_out = int(band_metadata.get('dim_out', 1))
+            w0 = float(config.get('w0', 30.0))
+
+            model = Siren(
+                dim_in=dim_in,
+                dim_hidden=int(hidden_size),
+                dim_out=dim_out,
+                num_layers=int(layers),
+                final_activation=None,
+                w0_initial=w0,
+                w0=w0,
+            ).to(device)
+
+            if isinstance(checkpoint_raw, dict) and 'state_dict' in checkpoint_raw:
+                state_dict = checkpoint_raw['state_dict']
+            else:
+                state_dict = checkpoint_raw
+            model.load_state_dict(state_dict)
+            model.eval()
+
+            model_data = {
+                'coeff_mean': np.asarray(band_metadata['coeff_mean']),
+                'coeff_std': np.asarray(band_metadata['coeff_std']),
+            }
+            band_shape_to_use = tuple(band_metadata['shape'])
+            sparse_mask_to_use = band_metadata.get('sparse_mask')
+        else:
+            # Backward compatibility for older full checkpoints.
+            model, legacy_checkpoint = load_siren_checkpoint(checkpoint_path, device)
+            coeff_mean = legacy_checkpoint.get('coeff_mean', legacy_checkpoint.get('mean'))
+            coeff_std = legacy_checkpoint.get('coeff_std', legacy_checkpoint.get('std'))
+            if coeff_mean is None or coeff_std is None:
+                raise ValueError(f"Legacy checkpoint missing normalization stats: {checkpoint_path}")
+            model_data = {
+                'coeff_mean': np.asarray(coeff_mean),
+                'coeff_std': np.asarray(coeff_std),
+            }
+            band_shape_to_use = tuple(legacy_checkpoint['shape'])
+            sparse_mask_to_use = legacy_checkpoint.get('sparse_mask')
+            config = candidate.get('config', {})
+
+        if isinstance(checkpoint_raw, dict) and 'state_dict' in checkpoint_raw:
+            checkpoint_for_size = checkpoint_raw
+        else:
+            checkpoint_for_size = checkpoint_raw
+
         coeffs = reconstruct_band_from_model(
             model,
-            checkpoint,
-            tuple(checkpoint['shape']),
-            checkpoint.get('sparse_mask'),
+            model_data,
+            band_shape_to_use,
+            sparse_mask_to_use,
             device,
         )
 
-        file_size_kb, param_size_fp16_kb = calculate_checkpoint_sizes(checkpoint_path, checkpoint)
+        file_size_kb, param_size_fp16_kb = calculate_checkpoint_sizes(checkpoint_path, checkpoint_for_size)
 
         options.append({
             'band_key': band_key,
             'option_id': f'{band_key}_{idx}',
             'checkpoint_path': checkpoint_path,
             'config_label': candidate.get('config_label', 'unknown'),
+            'config': config,
             'training_psnr': candidate.get('training_psnr'),
             'is_best': checkpoint_path == best_checkpoint_abs,
             'checkpoint_file_size_kb': file_size_kb,

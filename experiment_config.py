@@ -52,53 +52,56 @@ class HyperParamConfig:
 
 NETWORK_CONFIG_GROUPS: Dict[str, List[NetworkConfig]] = {
     "y_ll": [
-        NetworkConfig(layers=3, hidden_size=6),
-        NetworkConfig(layers=3, hidden_size=12),
-        NetworkConfig(layers=6, hidden_size=12),
-        NetworkConfig(layers=3, hidden_size=21),
-        NetworkConfig(layers=6, hidden_size=30),
-        NetworkConfig(layers=6, hidden_size=42),
+        # NetworkConfig(layers=3, hidden_size=6),
+        # NetworkConfig(layers=3, hidden_size=12),
+        # NetworkConfig(layers=6, hidden_size=12),
+        # NetworkConfig(layers=3, hidden_size=21),
+        # NetworkConfig(layers=6, hidden_size=30),
+        # NetworkConfig(layers=6, hidden_size=42),
         NetworkConfig(layers=8, hidden_size=56),
-        NetworkConfig(layers=10, hidden_size=56),
+        # NetworkConfig(layers=10, hidden_size=56),
     ],
     "uv_ll": [
-        NetworkConfig(layers=3, hidden_size=6),
-        NetworkConfig(layers=3, hidden_size=12),
-        NetworkConfig(layers=6, hidden_size=12),
-        NetworkConfig(layers=3, hidden_size=21),
+        # NetworkConfig(layers=3, hidden_size=6),
+        # NetworkConfig(layers=3, hidden_size=12),
+        # NetworkConfig(layers=6, hidden_size=12),
+        # NetworkConfig(layers=3, hidden_size=21),
         NetworkConfig(layers=6, hidden_size=30),
-        NetworkConfig(layers=6, hidden_size=42),
-        NetworkConfig(layers=8, hidden_size=56),
-        NetworkConfig(layers=10, hidden_size=56),
+        # NetworkConfig(layers=6, hidden_size=42),
+        # NetworkConfig(layers=8, hidden_size=56),
+        # NetworkConfig(layers=10, hidden_size=56),
     ],
     "hf": [
-        NetworkConfig(layers=3, hidden_size=6),
-        NetworkConfig(layers=3, hidden_size=12),
-        NetworkConfig(layers=6, hidden_size=12),
+        # NetworkConfig(layers=3, hidden_size=6),
+        # NetworkConfig(layers=3, hidden_size=12),
+        # NetworkConfig(layers=6, hidden_size=12),
         NetworkConfig(layers=3, hidden_size=21),
-        NetworkConfig(layers=6, hidden_size=30),
-        NetworkConfig(layers=6, hidden_size=42),
-        NetworkConfig(layers=8, hidden_size=56),
-        NetworkConfig(layers=10, hidden_size=56),
+        # NetworkConfig(layers=6, hidden_size=30),
+        # NetworkConfig(layers=6, hidden_size=42),
+        # NetworkConfig(layers=8, hidden_size=56),
+        # NetworkConfig(layers=10, hidden_size=56),
     ],
 }
 
 ITERATION_CONFIG_GROUPS: Dict[str, List[int]] = {
-    "y_ll": [100, 300, 500, 1000, 2000, 5000, 10000],
-    "uv_ll": [100, 300, 500, 1000, 2000, 5000, 10000],
-    "hf": [100, 300, 500, 1000, 2000, 5000, 10000],
+    # "y_ll": [100, 300, 500, 1000, 2000, 5000, 10000],
+    # "uv_ll": [100, 300, 500, 1000, 2000, 5000, 10000],
+    # "hf": [100, 300, 500, 1000, 2000, 5000, 10000],
+    "y_ll": [5000],
+    "uv_ll": [2000],
+    "hf": [1000],
 }
 
 HYPERPARAM_CONFIG_GROUPS: Dict[str, List[HyperParamConfig]] = {
     "y_ll": [
         HyperParamConfig(lr=2e-4, w0=30.0),
-        HyperParamConfig(lr=1.5e-4, w0=30.0),
+        # HyperParamConfig(lr=1.5e-4, w0=30.0),
     ],
     "uv_ll": [
         HyperParamConfig(lr=2e-4, w0=30.0),
     ],
     "hf": [
-        HyperParamConfig(lr=2e-4, w0=40.0),
+        # HyperParamConfig(lr=2e-4, w0=40.0),
         HyperParamConfig(lr=1.5e-4, w0=60.0),
     ],
 }
