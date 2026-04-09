@@ -1,0 +1,9 @@
+# Minimal dependencies for:
+# - train_dwt_siren.py
+# - reconstruct_dwt_siren.py
+
+numpy
+PyWavelets
+torch
+Pillow
+tqdm
