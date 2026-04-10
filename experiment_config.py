@@ -14,7 +14,6 @@ IMAGEID = "kodim08"
 MODEL_DIR = f"results/dwt_siren_models/{IMAGEID}"
 OUTPUT_DIR = "results/reconstructed_images"
 
-THRESHOLD_FACTOR = 1.5
 TRAIN_HF_BANDS = True
 COMPARE_CONFIGS = True
 SKIP_HF_TRAINING = False

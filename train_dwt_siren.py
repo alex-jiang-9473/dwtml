@@ -26,7 +26,6 @@ from experiment_config import (
     LEVELS,
     MODEL_DIR,
     SKIP_HF_TRAINING,
-    THRESHOLD_FACTOR,
     TRAIN_HF_BANDS,
     build_band_checkpoint_name,
     format_band_config,
