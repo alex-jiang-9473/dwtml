@@ -8,6 +8,7 @@ Based on dwt_siren_split_yuv_channels.py logic but split for clarity.
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
+import csv
 import json
 import time
 import numpy as np
@@ -371,6 +372,163 @@ def train_band_candidate(task, config, device, output_dir):
     }
 
 
+def write_band_comparison_csv(band_summary, output_path):
+    """Write one row per candidate for a single-band comparison report."""
+    fieldnames = [
+        'channel_name',
+        'band_name',
+        'band_id',
+        'role',
+        'dense',
+        'shape_h',
+        'shape_w',
+        'candidate_count',
+        'best_config_label',
+        'best_training_psnr',
+        'candidate_rank',
+        'candidate_is_best',
+        'config_label',
+        'layers',
+        'hidden_size',
+        'iterations',
+        'lr',
+        'w0',
+        'training_psnr',
+        'training_time_sec',
+        'memory_peak_mb',
+        'params',
+        'num_coeffs',
+        'checkpoint_name',
+        'checkpoint_path',
+    ]
+
+    shape = band_summary.get('shape') or [None, None]
+    shape_h = shape[0] if len(shape) > 0 else None
+    shape_w = shape[1] if len(shape) > 1 else None
+    best_label = band_summary.get('best_config_label')
+
+    rows = []
+    for rank, candidate in enumerate(band_summary.get('candidates', []), start=1):
+        config = candidate.get('config', {})
+        rows.append({
+            'channel_name': band_summary.get('channel_name'),
+            'band_name': band_summary.get('band_name'),
+            'band_id': band_summary.get('band_id'),
+            'role': band_summary.get('role'),
+            'dense': band_summary.get('dense'),
+            'shape_h': shape_h,
+            'shape_w': shape_w,
+            'candidate_count': band_summary.get('candidate_count'),
+            'best_config_label': best_label,
+            'best_training_psnr': band_summary.get('best_training_psnr'),
+            'candidate_rank': rank,
+            'candidate_is_best': candidate.get('config_label') == best_label,
+            'config_label': candidate.get('config_label'),
+            'layers': config.get('layers'),
+            'hidden_size': config.get('hidden_size'),
+            'iterations': config.get('iterations'),
+            'lr': config.get('lr'),
+            'w0': config.get('w0'),
+            'training_psnr': candidate.get('training_psnr'),
+            'training_time_sec': candidate.get('training_time_sec'),
+            'memory_peak_mb': candidate.get('memory_peak_mb'),
+            'params': candidate.get('params'),
+            'num_coeffs': candidate.get('num_coeffs'),
+            'checkpoint_name': candidate.get('checkpoint_name'),
+            'checkpoint_path': candidate.get('checkpoint_path'),
+        })
+
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_manifest_csv(manifest, output_path):
+    """Write one row per candidate across all bands in the training manifest."""
+    fieldnames = [
+        'image_id',
+        'levels',
+        'wavelet',
+        'compare_configs',
+        'train_hf_bands',
+        'band_key',
+        'channel_name',
+        'band_name',
+        'band_id',
+        'role',
+        'dense',
+        'shape_h',
+        'shape_w',
+        'candidate_count',
+        'best_config_label',
+        'best_training_psnr',
+        'candidate_rank',
+        'candidate_is_best',
+        'config_label',
+        'layers',
+        'hidden_size',
+        'iterations',
+        'lr',
+        'w0',
+        'training_psnr',
+        'training_time_sec',
+        'memory_peak_mb',
+        'params',
+        'num_coeffs',
+        'checkpoint_name',
+        'checkpoint_path',
+    ]
+
+    rows = []
+    for band_key, band_summary in (manifest.get('bands') or {}).items():
+        shape = band_summary.get('shape') or [None, None]
+        shape_h = shape[0] if len(shape) > 0 else None
+        shape_w = shape[1] if len(shape) > 1 else None
+        best_label = band_summary.get('best_config_label')
+
+        for rank, candidate in enumerate(band_summary.get('candidates', []), start=1):
+            config = candidate.get('config', {})
+            rows.append({
+                'image_id': manifest.get('image_id'),
+                'levels': manifest.get('levels'),
+                'wavelet': manifest.get('wavelet'),
+                'compare_configs': manifest.get('compare_configs'),
+                'train_hf_bands': manifest.get('train_hf_bands'),
+                'band_key': band_key,
+                'channel_name': band_summary.get('channel_name'),
+                'band_name': band_summary.get('band_name'),
+                'band_id': band_summary.get('band_id'),
+                'role': band_summary.get('role'),
+                'dense': band_summary.get('dense'),
+                'shape_h': shape_h,
+                'shape_w': shape_w,
+                'candidate_count': band_summary.get('candidate_count'),
+                'best_config_label': best_label,
+                'best_training_psnr': band_summary.get('best_training_psnr'),
+                'candidate_rank': rank,
+                'candidate_is_best': candidate.get('config_label') == best_label,
+                'config_label': candidate.get('config_label'),
+                'layers': config.get('layers'),
+                'hidden_size': config.get('hidden_size'),
+                'iterations': config.get('iterations'),
+                'lr': config.get('lr'),
+                'w0': config.get('w0'),
+                'training_psnr': candidate.get('training_psnr'),
+                'training_time_sec': candidate.get('training_time_sec'),
+                'memory_peak_mb': candidate.get('memory_peak_mb'),
+                'params': candidate.get('params'),
+                'num_coeffs': candidate.get('num_coeffs'),
+                'checkpoint_name': candidate.get('checkpoint_name'),
+                'checkpoint_path': candidate.get('checkpoint_path'),
+            })
+
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def train_band_experiments(task, device):
     """Train a band using one or more configs and return the best checkpoint metadata."""
     band_dir = os.path.join(MODEL_DIR, task['channel_name'], task['band_name'])
@@ -427,6 +585,9 @@ def train_band_experiments(task, device):
     summary_path = os.path.join(band_dir, 'comparison.json')
     with open(summary_path, 'w') as f:
         json.dump(band_summary, f, indent=2)
+
+    summary_csv_path = os.path.join(band_dir, 'comparison.csv')
+    write_band_comparison_csv(band_summary, summary_csv_path)
 
     print(f"  Best config: {best_result['config_label']} | PSNR={best_result['training_psnr']:.2f} dB")
     print(f"  Saved best checkpoint: {best_checkpoint_path}")
@@ -498,11 +659,15 @@ def main():
     with open(manifest_path, 'w') as f:
         json.dump(manifest, f, indent=2)
 
+    manifest_csv_path = os.path.join(MODEL_DIR, 'manifest.csv')
+    write_manifest_csv(manifest, manifest_csv_path)
+
     elapsed = time.time() - start_time
     print(f"\n{'='*70}")
     print("TRAINING COMPLETE")
     print(f"{'='*70}")
     print(f"Manifest saved to: {manifest_path}")
+    print(f"Manifest CSV saved to: {manifest_csv_path}")
     print(f"Total bands trained: {len(manifest['bands'])}")
     print(f"Elapsed time: {elapsed:.2f} seconds")
     print(f"Models stored under: {MODEL_DIR}")
