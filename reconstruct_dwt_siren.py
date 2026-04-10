@@ -8,6 +8,7 @@ Based on dwt_siren_split_yuv_channels.py logic.
 import os
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
+import csv
 import json
 from itertools import product
 import numpy as np
@@ -330,6 +331,89 @@ def sample_option_index_tuples(axis_sizes, sample_count, seed):
         sampled_list.append(idx_tuple)
 
     return sampled_list
+
+
+def write_combination_metrics_csv(results, output_path):
+    """Write one row per evaluated combination with aggregate metrics."""
+    fieldnames = [
+        'combo_index',
+        'image_path',
+        'y_psnr',
+        'u_psnr',
+        'v_psnr',
+        'rgb_psnr',
+        'total_checkpoint_file_size_kb',
+        'total_param_size_fp16_kb',
+    ]
+
+    rows = []
+    for result in results:
+        metrics = result.get('metrics', {})
+        rows.append({
+            'combo_index': result.get('combo_index'),
+            'image_path': result.get('image_path'),
+            'y_psnr': metrics.get('y_psnr'),
+            'u_psnr': metrics.get('u_psnr'),
+            'v_psnr': metrics.get('v_psnr'),
+            'rgb_psnr': metrics.get('rgb_psnr'),
+            'total_checkpoint_file_size_kb': result.get('total_checkpoint_file_size_kb'),
+            'total_param_size_fp16_kb': result.get('total_param_size_fp16_kb'),
+        })
+
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_combination_selection_csv(results, output_path):
+    """Write one row per selected sub-band option inside each evaluated combination."""
+    fieldnames = [
+        'combo_index',
+        'band_key',
+        'option_id',
+        'config_label',
+        'checkpoint_path',
+        'training_psnr',
+        'is_best',
+        'checkpoint_file_size_kb',
+        'param_size_fp16_kb',
+    ]
+
+    rows = []
+    for result in results:
+        combo_index = result.get('combo_index')
+        for selected in result.get('selected_sub_bands', []):
+            rows.append({
+                'combo_index': combo_index,
+                'band_key': selected.get('band_key'),
+                'option_id': selected.get('option_id'),
+                'config_label': selected.get('config_label'),
+                'checkpoint_path': selected.get('checkpoint_path'),
+                'training_psnr': selected.get('training_psnr'),
+                'is_best': selected.get('is_best'),
+                'checkpoint_file_size_kb': selected.get('checkpoint_file_size_kb'),
+                'param_size_fp16_kb': selected.get('param_size_fp16_kb'),
+            })
+
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_best_per_band_csv(best_per_band_config, output_path):
+    """Write one row per sub-band for the best-per-band (training PSNR) selection."""
+    fieldnames = [
+        'band_key',
+        'config_label',
+        'training_psnr',
+    ]
+
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(best_per_band_config)
 
 
 def reconstruct_channel_from_manifest(channel_name, original_coeffs, manifest, device='cuda'):
@@ -679,10 +763,21 @@ def main():
     with open(log_path, 'w') as f:
         json.dump(summary, f, indent=2)
 
+    combo_metrics_csv_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_combination_metrics.csv")
+    combo_selection_csv_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_combination_selections.csv")
+    best_per_band_csv_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_best_per_band_training.csv")
+
+    write_combination_metrics_csv(all_results, combo_metrics_csv_path)
+    write_combination_selection_csv(all_results, combo_selection_csv_path)
+    write_best_per_band_csv(best_per_band_config, best_per_band_csv_path)
+
     print(f"\n{'='*70}")
     print("COMBINATION EVALUATION COMPLETE")
     print(f"{'='*70}")
     print(f"Combination log saved to: {log_path}\n")
+    print(f"Combination metrics CSV saved to: {combo_metrics_csv_path}")
+    print(f"Combination selections CSV saved to: {combo_selection_csv_path}")
+    print(f"Best-per-band CSV saved to: {best_per_band_csv_path}\n")
 
     if best_per_band_result is not None:
         print(f"BEST PER-BAND (from training PSNR):")
