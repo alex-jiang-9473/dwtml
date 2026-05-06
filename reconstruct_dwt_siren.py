@@ -25,11 +25,56 @@ from dwt_siren_common import (
 )
 
 
-# Evaluate every checkpoint combination across all sub-bands.
+# ============================================================================== 
+# CONFIGURATION
+# ==============================================================================
+
+# Mode: Choose between random combinations or specified custom models
+USE_CUSTOM_BAND_MODELS = True  # Set to True to use specified models, False for combinations
+
+# Single band reconstruction mode
+USE_ONLY_LL_BAND = True  # Set to True to reconstruct using only LL bands with zeros for HF
+USE_Y_LL_ONLY = False  # If True: use only Y_LL (U,V = zeros). If False: use Y_LL, U_LL, V_LL
+USE_HYBRID_LL_ORIGINAL_HF = True  # If True (requires USE_ONLY_LL_BAND=True): use reconstructed LL + original HF bands
+
+# Evaluate every checkpoint combination across all sub-bands (only used if USE_CUSTOM_BAND_MODELS=False)
 MAX_COMBINATIONS = 10  # Cap runtime by sampling this many combinations.
 SAMPLE_RANDOM_COMBINATIONS = True
 RANDOM_SAMPLE_SEED = 2
 SAVE_COMBINATION_IMAGES = True
+
+# Custom band models (optional): Specify exact model paths per band.
+# Only used if USE_CUSTOM_BAND_MODELS = True
+# Format: 'CHANNEL_BAND': '/path/to/model.pt'
+# Leave empty dict {} if not using custom models.
+CUSTOM_BAND_MODELS = {
+    # Y channel
+    'Y_LL': 'results/dwt_siren_models/kodim08/Y/LL/best_model.pt',
+    'Y_cH_L1': 'results/dwt_siren_models/kodim08/Y/cH_L1/best_model.pt',
+    'Y_cV_L1': 'results/dwt_siren_models/kodim08/Y/cV_L1/best_model.pt',
+    'Y_cD_L1': 'results/dwt_siren_models/kodim08/Y/cD_L1/best_model.pt',
+    'Y_cH_L2': 'results/dwt_siren_models/kodim08/Y/cH_L2/best_model.pt',
+    'Y_cV_L2': 'results/dwt_siren_models/kodim08/Y/cV_L2/best_model.pt',
+    'Y_cD_L2': 'results/dwt_siren_models/kodim08/Y/cD_L2/best_model.pt',
+    
+    # U channel
+    'U_LL': 'results/dwt_siren_models/kodim08/U/LL/best_model.pt',
+    'U_cH_L1': 'results/dwt_siren_models/kodim08/U/cH_L1/best_model.pt',
+    'U_cV_L1': 'results/dwt_siren_models/kodim08/U/cV_L1/best_model.pt',
+    'U_cD_L1': 'results/dwt_siren_models/kodim08/U/cD_L1/best_model.pt',
+    'U_cH_L2': 'results/dwt_siren_models/kodim08/U/cH_L2/best_model.pt',
+    'U_cV_L2': 'results/dwt_siren_models/kodim08/U/cV_L2/best_model.pt',
+    'U_cD_L2': 'results/dwt_siren_models/kodim08/U/cD_L2/best_model.pt',
+    
+    # V channel
+    'V_LL': 'results/dwt_siren_models/kodim08/V/LL/best_model.pt',
+    'V_cH_L1': 'results/dwt_siren_models/kodim08/V/cH_L1/best_model.pt',
+    'V_cV_L1': 'results/dwt_siren_models/kodim08/V/cV_L1/best_model.pt',
+    'V_cD_L1': 'results/dwt_siren_models/kodim08/V/cD_L1/best_model.pt',
+    'V_cH_L2': 'results/dwt_siren_models/kodim08/V/cH_L2/best_model.pt',
+    'V_cV_L2': 'results/dwt_siren_models/kodim08/V/cV_L2/best_model.pt',
+    'V_cD_L2': 'results/dwt_siren_models/kodim08/V/cD_L2/best_model.pt',
+}
 
 # ============================================================================== 
 # UTILITIES
@@ -135,9 +180,123 @@ def calculate_checkpoint_sizes(checkpoint_path, checkpoint_dict):
     return file_size_kb, fp16_size_kb
 
 
+def infer_siren_architecture(state_dict):
+    """Infer SIREN architecture (num_layers, hidden_size) from state_dict."""
+    # Find layer dimensions from the first linear layer
+    if 'net.0.linear.weight' in state_dict:
+        first_weight = state_dict['net.0.linear.weight']
+        hidden_size = first_weight.shape[0]  # output dim of first layer
+    else:
+        return None, None
+    
+    # Count layers by finding the highest layer index
+    max_layer_idx = -1
+    for key in state_dict.keys():
+        if key.startswith('net.') and '.linear.' in key:
+            layer_idx = int(key.split('.')[1])
+            max_layer_idx = max(max_layer_idx, layer_idx)
+    
+    # Number of layers includes input, hidden, and output
+    num_layers = max_layer_idx + 1
+    
+    return num_layers, hidden_size
+
+
 def load_band_options(channel_name, band_name, band_shape, manifest, device='cuda'):
     """Load all available candidate checkpoints for one band and precompute coefficients."""
     band_key = f'{channel_name}_{band_name}'
+    
+    # Check if custom model path is specified for this band
+    if band_key in CUSTOM_BAND_MODELS:
+        custom_model_path = resolve_checkpoint_path(CUSTOM_BAND_MODELS[band_key])
+        if not os.path.exists(custom_model_path):
+            raise FileNotFoundError(f"Custom model not found: {custom_model_path}")
+        
+        print(f"  Loading custom model for {band_key}: {custom_model_path}")
+        
+        # Try to load with metadata first
+        band_records = manifest.get('bands', {})
+        band_record = band_records.get(band_key)
+        metadata_path = band_record.get('band_metadata_path') if band_record else None
+        
+        checkpoint_raw = torch.load(custom_model_path, map_location=device, weights_only=False)
+        
+        # Extract state_dict
+        if isinstance(checkpoint_raw, dict) and 'state_dict' in checkpoint_raw:
+            state_dict = checkpoint_raw['state_dict']
+        else:
+            state_dict = checkpoint_raw
+        
+        # Infer architecture from state_dict
+        num_layers, hidden_size = infer_siren_architecture(state_dict)
+        
+        if num_layers is None or hidden_size is None:
+            raise ValueError(f"Could not infer SIREN architecture from checkpoint: {custom_model_path}")
+        
+        if metadata_path and os.path.exists(resolve_checkpoint_path(metadata_path)):
+            metadata_path = resolve_checkpoint_path(metadata_path)
+            band_metadata = torch.load(metadata_path, map_location='cpu', weights_only=False)
+            
+            dim_in = int(band_metadata.get('dim_in', 2))
+            dim_out = int(band_metadata.get('dim_out', 1))
+            w0 = 30.0
+            
+            model = Siren(
+                dim_in=dim_in,
+                dim_hidden=int(hidden_size),
+                dim_out=dim_out,
+                num_layers=int(num_layers),
+                final_activation=None,
+                w0_initial=w0,
+                w0=w0,
+            ).to(device)
+            
+            model.load_state_dict(state_dict)
+            model.eval()
+            
+            model_data = {
+                'coeff_mean': np.asarray(band_metadata['coeff_mean']),
+                'coeff_std': np.asarray(band_metadata['coeff_std']),
+            }
+            band_shape_to_use = tuple(band_metadata['shape'])
+            sparse_mask_to_use = band_metadata.get('sparse_mask')
+        else:
+            # Fallback: load as legacy checkpoint
+            model, legacy_checkpoint = load_siren_checkpoint(custom_model_path, device)
+            coeff_mean = legacy_checkpoint.get('coeff_mean', legacy_checkpoint.get('mean'))
+            coeff_std = legacy_checkpoint.get('coeff_std', legacy_checkpoint.get('std'))
+            if coeff_mean is None or coeff_std is None:
+                raise ValueError(f"Custom checkpoint missing normalization stats: {custom_model_path}")
+            model_data = {
+                'coeff_mean': np.asarray(coeff_mean),
+                'coeff_std': np.asarray(coeff_std),
+            }
+            band_shape_to_use = tuple(legacy_checkpoint['shape'])
+            sparse_mask_to_use = legacy_checkpoint.get('sparse_mask')
+        
+        coeffs = reconstruct_band_from_model(
+            model,
+            model_data,
+            band_shape_to_use,
+            sparse_mask_to_use,
+            device,
+        )
+        
+        file_size_kb, param_size_fp16_kb = calculate_checkpoint_sizes(custom_model_path, checkpoint_raw)
+        
+        return [{
+            'band_key': band_key,
+            'option_id': f'{band_key}_custom',
+            'checkpoint_path': custom_model_path,
+            'config_label': 'custom',
+            'training_psnr': None,
+            'is_best': False,
+            'checkpoint_file_size_kb': file_size_kb,
+            'param_size_fp16_kb': param_size_fp16_kb,
+            'coeffs': coeffs,
+        }]
+    
+    # Otherwise, use manifest-driven loading
     band_records = manifest.get('bands', {})
     band_record = band_records.get(band_key)
 
@@ -481,6 +640,17 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
+    # Validate configuration
+    if USE_CUSTOM_BAND_MODELS and not CUSTOM_BAND_MODELS:
+        raise ValueError(
+            "USE_CUSTOM_BAND_MODELS is True but CUSTOM_BAND_MODELS is empty. "
+            "Either fill CUSTOM_BAND_MODELS or set USE_CUSTOM_BAND_MODELS=False"
+        )
+    
+    print(f"\n{'='*70}")
+    print(f"MODE: {'CUSTOM MODELS' if USE_CUSTOM_BAND_MODELS else 'RANDOM COMBINATIONS'}")
+    print(f"{'='*70}")
+    
     # Load original image for comparison
     img_path = f"kodak-dataset/{IMAGEID}.png"
     img_rgb = Image.open(img_path)
@@ -515,6 +685,302 @@ def main():
     print(f"Compare configs: {manifest.get('compare_configs', False)}")
     print(f"HF training: {manifest.get('train_hf_bands', False)}")
 
+    # ========================================================================
+    # LL BAND ONLY RECONSTRUCTION MODE
+    # ========================================================================
+    if USE_ONLY_LL_BAND:
+        # Determine mode description
+        if USE_HYBRID_LL_ORIGINAL_HF:
+            mode_desc = "Y_LL (reconstructed) + original HF" if USE_Y_LL_ONLY else "Y_LL, U_LL, V_LL (reconstructed) + original HF"
+            hf_source = "original"
+        else:
+            mode_desc = "Y_LL ONLY (U,V = zeros)" if USE_Y_LL_ONLY else "Y_LL, U_LL, V_LL (+ zeros for HF)"
+            hf_source = "zeros"
+        
+        print(f"\n{'='*70}")
+        print(f"RECONSTRUCTING USING LL BANDS: {mode_desc}")
+        print(f"HF bands: {hf_source}")
+        print(f"{'='*70}")
+        
+        # Load Y_LL band
+        y_ll_options = load_band_options('Y', 'LL', y_coeffs_orig[0].shape, manifest, device)
+        y_ll_coeffs = y_ll_options[0]['coeffs']
+        
+        # Load or create U_LL and V_LL
+        if USE_Y_LL_ONLY:
+            u_ll_coeffs = np.zeros(u_coeffs_orig[0].shape, dtype=np.float32)
+            v_ll_coeffs = np.zeros(v_coeffs_orig[0].shape, dtype=np.float32)
+        else:
+            u_ll_options = load_band_options('U', 'LL', u_coeffs_orig[0].shape, manifest, device)
+            u_ll_coeffs = u_ll_options[0]['coeffs']
+            
+            v_ll_options = load_band_options('V', 'LL', v_coeffs_orig[0].shape, manifest, device)
+            v_ll_coeffs = v_ll_options[0]['coeffs']
+        
+        # Build Y coefficients: LL + HF (original or zeros)
+        y_coeffs_rec = [y_ll_coeffs]
+        for level_idx in range(1, LEVELS + 1):
+            if USE_HYBRID_LL_ORIGINAL_HF:
+                # Use original HF bands
+                y_coeffs_rec.append(y_coeffs_orig[level_idx])
+            else:
+                # Use zeros for HF
+                hf_shape = y_coeffs_orig[level_idx][0].shape
+                y_coeffs_rec.append((
+                    np.zeros(hf_shape, dtype=np.float32),
+                    np.zeros(hf_shape, dtype=np.float32),
+                    np.zeros(hf_shape, dtype=np.float32),
+                ))
+        
+        # Build U coefficients: LL + HF (original or zeros)
+        u_coeffs_rec = [u_ll_coeffs]
+        for level_idx in range(1, LEVELS + 1):
+            if USE_HYBRID_LL_ORIGINAL_HF:
+                # Use original HF bands
+                u_coeffs_rec.append(u_coeffs_orig[level_idx])
+            else:
+                # Use zeros for HF
+                hf_shape = u_coeffs_orig[level_idx][0].shape
+                u_coeffs_rec.append((
+                    np.zeros(hf_shape, dtype=np.float32),
+                    np.zeros(hf_shape, dtype=np.float32),
+                    np.zeros(hf_shape, dtype=np.float32),
+                ))
+        
+        # Build V coefficients: LL + HF (original or zeros)
+        v_coeffs_rec = [v_ll_coeffs]
+        for level_idx in range(1, LEVELS + 1):
+            if USE_HYBRID_LL_ORIGINAL_HF:
+                # Use original HF bands
+                v_coeffs_rec.append(v_coeffs_orig[level_idx])
+            else:
+                # Use zeros for HF
+                hf_shape = v_coeffs_orig[level_idx][0].shape
+                v_coeffs_rec.append((
+                    np.zeros(hf_shape, dtype=np.float32),
+                    np.zeros(hf_shape, dtype=np.float32),
+                    np.zeros(hf_shape, dtype=np.float32),
+                ))
+        
+        # Reconstruct image
+        y_rec = pywt.waverec2(y_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+        u_rec = pywt.waverec2(u_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+        v_rec = pywt.waverec2(v_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+        
+        yuv_rec = np.stack([y_rec, u_rec, v_rec], axis=2)
+        rgb_rec = yuv_to_rgb(yuv_rec)
+        
+        # Save reconstructed image
+        ll_only_image_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_reconstructed_ll_only.png")
+        Image.fromarray(rgb_rec).save(ll_only_image_path)
+        
+        # Calculate metrics
+        y_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(y_channel.flatten()),
+            torch.FloatTensor(y_rec.flatten())
+        )
+        u_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(u_channel.flatten()),
+            torch.FloatTensor(u_rec.flatten())
+        )
+        v_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(v_channel.flatten()),
+            torch.FloatTensor(v_rec.flatten())
+        )
+        rgb_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(np.array(img_rgb).flatten()),
+            torch.FloatTensor(rgb_rec.flatten())
+        )
+        
+        # Save results
+        log_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_ll_only_log.json")
+        
+        # Build mode key and description based on configuration
+        if USE_HYBRID_LL_ORIGINAL_HF:
+            mode_key = 'hybrid_ll_y_original_hf' if USE_Y_LL_ONLY else 'hybrid_ll_yuv_original_hf'
+            description = 'Hybrid: Reconstructed Y_LL + original HF bands (U,V = zeros)' if USE_Y_LL_ONLY else 'Hybrid: Reconstructed Y_LL, U_LL, V_LL + original HF bands'
+        else:
+            mode_key = 'll_only_y' if USE_Y_LL_ONLY else 'll_only_yuv'
+            description = 'LL-only: Y_LL only (U,V = zeros)' if USE_Y_LL_ONLY else 'LL-only: Y_LL, U_LL, V_LL bands with zeros for all HF bands'
+        
+        ll_only_result = {
+            'image_id': IMAGEID,
+            'levels': LEVELS,
+            'wavelet': WAVELET,
+            'mode': mode_key,
+            'description': description,
+            'image_path': ll_only_image_path,
+            'metrics': {
+                'y_psnr': float(y_psnr),
+                'u_psnr': float(u_psnr),
+                'v_psnr': float(v_psnr),
+                'rgb_psnr': float(rgb_psnr),
+            },
+        }
+        
+        with open(log_path, 'w') as f:
+            json.dump(ll_only_result, f, indent=2)
+        
+        print(f"\n{'='*70}")
+        print("LL-ONLY RECONSTRUCTION COMPLETE")
+        print(f"{'='*70}")
+        print(f"Image saved to: {ll_only_image_path}")
+        print(f"Results saved to: {log_path}")
+        print(f"\nMetrics ({mode_desc}):")
+        print(f"  Y PSNR: {y_psnr:.2f} dB")
+        print(f"  U PSNR: {u_psnr:.2f} dB")
+        print(f"  V PSNR: {v_psnr:.2f} dB")
+        print(f"  RGB PSNR: {rgb_psnr:.2f} dB")
+        return
+
+    # ========================================================================
+    # CUSTOM MODELS MODE
+    # ========================================================================
+    if USE_CUSTOM_BAND_MODELS:
+        print(f"\n{'='*70}")
+        print("LOADING CUSTOM SPECIFIED MODELS")
+        print(f"{'='*70}")
+        
+        selected_by_channel = {'Y': {}, 'U': {}, 'V': {}}
+        
+        # Load all custom band models
+        for band_key, model_path in CUSTOM_BAND_MODELS.items():
+            parts = band_key.split('_', 1)
+            if len(parts) != 2:
+                raise ValueError(f"Invalid band key format: {band_key}. Expected 'CHANNEL_BAND'")
+            channel_name, band_name = parts
+            
+            if channel_name not in ['Y', 'U', 'V']:
+                raise ValueError(f"Invalid channel: {channel_name}. Must be Y, U, or V")
+            
+            # Determine band shape from original coefficients
+            if band_name == 'LL':
+                if channel_name == 'Y':
+                    band_shape = y_coeffs_orig[0].shape
+                elif channel_name == 'U':
+                    band_shape = u_coeffs_orig[0].shape
+                else:
+                    band_shape = v_coeffs_orig[0].shape
+            else:
+                # HF band: extract level from band_name (e.g., 'cH_L1' -> level 1)
+                level_match = band_name.split('_L')
+                if len(level_match) != 2:
+                    raise ValueError(f"Invalid HF band format: {band_name}. Expected 'cX_LN'")
+                try:
+                    level_idx = int(level_match[1])
+                except ValueError:
+                    raise ValueError(f"Invalid level in band: {band_name}")
+                
+                if channel_name == 'Y':
+                    band_shape = y_coeffs_orig[level_idx][0].shape
+                elif channel_name == 'U':
+                    band_shape = u_coeffs_orig[level_idx][0].shape
+                else:
+                    band_shape = v_coeffs_orig[level_idx][0].shape
+            
+            # Load band options (will return single custom option)
+            options = load_band_options(channel_name, band_name, band_shape, manifest, device)
+            selected = options[0]
+            selected_by_channel[channel_name][band_name] = selected
+            print(f"  Loaded {band_key}: {model_path}")
+        
+        # Reconstruct from custom models
+        print(f"\nReconstructing image from custom models...")
+        y_coeffs_rec = build_channel_coeffs_from_selection(y_coeffs_orig, selected_by_channel['Y'])
+        u_coeffs_rec = build_channel_coeffs_from_selection(u_coeffs_orig, selected_by_channel['U'])
+        v_coeffs_rec = build_channel_coeffs_from_selection(v_coeffs_orig, selected_by_channel['V'])
+
+        y_rec = pywt.waverec2(y_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+        u_rec = pywt.waverec2(u_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+        v_rec = pywt.waverec2(v_coeffs_rec, WAVELET)[:orig_h, :orig_w]
+
+        yuv_rec = np.stack([y_rec, u_rec, v_rec], axis=2)
+        rgb_rec = yuv_to_rgb(yuv_rec)
+
+        # Save reconstructed image
+        custom_image_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_reconstructed_custom.png")
+        Image.fromarray(rgb_rec).save(custom_image_path)
+        
+        # Calculate metrics
+        y_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(y_channel.flatten()),
+            torch.FloatTensor(y_rec.flatten())
+        )
+        u_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(u_channel.flatten()),
+            torch.FloatTensor(u_rec.flatten())
+        )
+        v_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(v_channel.flatten()),
+            torch.FloatTensor(v_rec.flatten())
+        )
+        rgb_psnr = util.get_clamped_psnr(
+            torch.FloatTensor(np.array(img_rgb).flatten()),
+            torch.FloatTensor(rgb_rec.flatten())
+        )
+        
+        # Build selection log
+        selection_log = []
+        total_checkpoint_file_size_kb = 0.0
+        total_param_size_fp16_kb = 0.0
+        for channel_name in ['Y', 'U', 'V']:
+            for band_name, selected in selected_by_channel[channel_name].items():
+                selection_log.append({
+                    'band_key': selected['band_key'],
+                    'option_id': selected['option_id'],
+                    'config_label': selected['config_label'],
+                    'checkpoint_path': selected['checkpoint_path'],
+                    'training_psnr': selected.get('training_psnr'),
+                    'is_best': selected['is_best'],
+                    'checkpoint_file_size_kb': selected.get('checkpoint_file_size_kb'),
+                    'param_size_fp16_kb': selected.get('param_size_fp16_kb'),
+                })
+                checkpoint_size = selected.get('checkpoint_file_size_kb')
+                if checkpoint_size is not None:
+                    total_checkpoint_file_size_kb += float(checkpoint_size)
+                fp16_size = selected.get('param_size_fp16_kb')
+                if fp16_size is not None:
+                    total_param_size_fp16_kb += float(fp16_size)
+        
+        # Save results
+        log_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_custom_models_log.json")
+        custom_result = {
+            'image_id': IMAGEID,
+            'levels': LEVELS,
+            'wavelet': WAVELET,
+            'mode': 'custom_models',
+            'image_path': custom_image_path,
+            'metrics': {
+                'y_psnr': float(y_psnr),
+                'u_psnr': float(u_psnr),
+                'v_psnr': float(v_psnr),
+                'rgb_psnr': float(rgb_psnr),
+            },
+            'total_checkpoint_file_size_kb': float(total_checkpoint_file_size_kb),
+            'total_param_size_fp16_kb': float(total_param_size_fp16_kb),
+            'selected_sub_bands': selection_log,
+        }
+        
+        with open(log_path, 'w') as f:
+            json.dump(custom_result, f, indent=2)
+        
+        print(f"\n{'='*70}")
+        print("CUSTOM MODELS RECONSTRUCTION COMPLETE")
+        print(f"{'='*70}")
+        print(f"Image saved to: {custom_image_path}")
+        print(f"Results saved to: {log_path}")
+        print(f"\nMetrics:")
+        print(f"  Y PSNR: {y_psnr:.2f} dB")
+        print(f"  U PSNR: {u_psnr:.2f} dB")
+        print(f"  V PSNR: {v_psnr:.2f} dB")
+        print(f"  RGB PSNR: {rgb_psnr:.2f} dB")
+        print(f"  Total file size: {total_checkpoint_file_size_kb:.1f} KB")
+        print(f"  Total FP16 param size: {total_param_size_fp16_kb:.1f} KB")
+        return
+
+    # ========================================================================
+    # COMBINATION SAMPLING MODE
+    # ========================================================================
     print(f"\n{'='*70}")
     print("LOADING SUB-BAND OPTIONS")
     print(f"{'='*70}")

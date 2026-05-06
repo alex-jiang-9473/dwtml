@@ -4,6 +4,8 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
+from scipy import ndimage
 
 from siren import Siren
 
@@ -46,6 +48,56 @@ def calculate_model_params(layers, hidden_size, dim_in=2, dim_out=1):
     hidden_layers = (layers - 1) * ((hidden_size * hidden_size) + hidden_size)
     output_layer = (hidden_size * dim_out) + dim_out
     return first_layer + hidden_layers + output_layer
+
+
+class EdgeHFNet(nn.Module):
+    """Small CNN that predicts one HF band from LL and edge features."""
+
+    def __init__(self, in_channels=3, hidden_channels=48, num_layers=5):
+        super().__init__()
+        num_layers = max(int(num_layers), 2)
+        hidden_channels = int(hidden_channels)
+
+        layers = [
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+        ]
+        for _ in range(num_layers - 2):
+            layers.extend([
+                nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+            ])
+        layers.append(nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1))
+
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def build_edge_cnn_inputs(ll_band):
+    """Build LL normalization plus Sobel edge channels for CNN training/inference."""
+    ll = np.asarray(ll_band, dtype=np.float32)
+    ll_mean = float(np.mean(ll))
+    ll_std = float(np.std(ll))
+    if ll_std < 1e-8:
+        ll_std = 1.0
+
+    ll_norm = (ll - ll_mean) / ll_std
+    sobel_y = ndimage.sobel(ll_norm, axis=0, mode="reflect").astype(np.float32)
+    sobel_x = ndimage.sobel(ll_norm, axis=1, mode="reflect").astype(np.float32)
+
+    inputs = np.stack([ll_norm, sobel_y, sobel_x], axis=0).astype(np.float32)
+    stats = {
+        "ll_mean": ll_mean,
+        "ll_std": ll_std,
+        "input_channels": 3,
+        "feature_layout": {
+            "type": "edge_cnn",
+            "channels": ["ll_norm", "sobel_y", "sobel_x"],
+        },
+    }
+    return inputs, stats
 
 
 def find_model_size_for_budget(target_params, dim_in=2, dim_out=1, strict_under=True):
