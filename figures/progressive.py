@@ -31,21 +31,22 @@ for idx in highlight_indices:
 		plt.plot(row["Cumulative Time (s)"], row["PSNR (dB)"], 
 		         marker="o", markersize=10, color="orange", zorder=5)
 
-plt.xlabel("Time (s)")
-plt.ylabel("PSNR (dB)")
+plt.xlabel("Time (s)", fontsize=14)
+plt.ylabel("PSNR (dB)", fontsize=14)
+plt.tick_params(axis='both', which='major', labelsize=12)
 plt.grid(True, alpha=0.3)
 
 # Set x-axis starting from 30s
 max_time = df["Cumulative Time (s)"].max()
 plt.xlim(30, max_time + 5)
 xticks = [30] + list(range(35, int(max_time) + 5, 5))
-plt.xticks(xticks)
+plt.xticks(xticks, fontsize=12)
 
 # Label each point with band name and parameter count (alternate up/down to reduce overlap)
 highlight_indices = [0, 9, 18]
 for idx, row in df.iterrows():
 	if pd.notna(row["PSNR (dB)"]):
-		y_offset = 5 if idx % 2 == 0 and idx!=18 else -5
+		y_offset = 5 if idx % 2 == 0 and idx!=18 and idx!=16 else -5
 		va = "bottom" if y_offset > 0 else "top"
 		
 		# Add PSNR to label for highlighted points
@@ -70,12 +71,12 @@ for idx, row in df.iterrows():
 # Add legend explaining label format
 from matplotlib.lines import Line2D
 legend_elements = [
-	Line2D([0], [0], color='none', marker='', linestyle='', label='Label format:'),
+	Line2D([0], [0], color='none', marker='', linestyle='', label='Label:'),
 	Line2D([0], [0], color='none', marker='', linestyle='', label='  • Frequency Band'),
-	Line2D([0], [0], color='none', marker='', linestyle='', label='  • No. of Params'),
-	Line2D([0], [0], color='none', marker='', linestyle='', label='  * PSNR'),
+	Line2D([0], [0], color='none', marker='', linestyle='', label='  • No. of Model Params'),
+	Line2D([0], [0], color='none', marker='', linestyle='', label='  • Cumulative PSNR'),
 ]
-plt.legend(handles=legend_elements, loc='lower right', fontsize=8, handlelength=0, handletextpad=0)
+plt.legend(handles=legend_elements, loc='lower right', fontsize=12, handlelength=0, handletextpad=0)
 
 plt.tight_layout()
 plt.show()

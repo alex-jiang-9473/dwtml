@@ -35,7 +35,7 @@ USE_CUSTOM_BAND_MODELS = True  # Set to True to use specified models, False for 
 # Single band reconstruction mode
 USE_ONLY_LL_BAND = True  # Set to True to reconstruct using only LL bands with zeros for HF
 USE_Y_LL_ONLY = False  # If True: use only Y_LL (U,V = zeros). If False: use Y_LL, U_LL, V_LL
-USE_HYBRID_LL_ORIGINAL_HF = True  # If True (requires USE_ONLY_LL_BAND=True): use reconstructed LL + original HF bands
+USE_HYBRID_LL_ORIGINAL_HF = False  # If True (requires USE_ONLY_LL_BAND=True): use reconstructed LL + original HF bands
 
 # Evaluate every checkpoint combination across all sub-bands (only used if USE_CUSTOM_BAND_MODELS=False)
 MAX_COMBINATIONS = 10  # Cap runtime by sampling this many combinations.
@@ -178,6 +178,47 @@ def calculate_checkpoint_sizes(checkpoint_path, checkpoint_dict):
     fp16_size_kb = (param_count * 2) / 1024.0 if param_count else None
 
     return file_size_kb, fp16_size_kb
+
+
+def calculate_bpp_from_param_sizes(param_size_fp16_kb_list, image_height, image_width):
+    """Calculate model BPP from FP16 parameter sizes.
+
+    Args:
+        param_size_fp16_kb_list: iterable of parameter sizes in KB
+        image_height: original image height
+        image_width: original image width
+
+    Returns:
+        BPP value or None if no parameter sizes are available
+    """
+    param_size_fp16_kb_list = [float(size) for size in param_size_fp16_kb_list if size is not None]
+    if not param_size_fp16_kb_list:
+        return None
+
+    total_bits = sum(size * 1024.0 * 8.0 for size in param_size_fp16_kb_list)
+    num_pixels = image_height * image_width * 3
+    return total_bits / num_pixels if num_pixels > 0 else None
+
+
+def collect_selected_param_sizes(selected_by_channel):
+    """Collect FP16 parameter sizes from selected band options."""
+    param_sizes = []
+    for channel_name in ['Y', 'U', 'V']:
+        for selected in selected_by_channel.get(channel_name, {}).values():
+            param_size = selected.get('param_size_fp16_kb')
+            if param_size is not None:
+                param_sizes.append(float(param_size))
+    return param_sizes
+
+
+def collect_param_sizes_from_option_map(option_map):
+    """Collect FP16 parameter sizes from a flat band->option mapping."""
+    param_sizes = []
+    for selected in option_map.values():
+        param_size = selected.get('param_size_fp16_kb')
+        if param_size is not None:
+            param_sizes.append(float(param_size))
+    return param_sizes
 
 
 def infer_siren_architecture(state_dict):
@@ -791,6 +832,17 @@ def main():
             torch.FloatTensor(np.array(img_rgb).flatten()),
             torch.FloatTensor(rgb_rec.flatten())
         )
+
+        ll_param_sizes = []
+        for selected_option in [y_ll_options[0]]:
+            if selected_option.get('param_size_fp16_kb') is not None:
+                ll_param_sizes.append(float(selected_option['param_size_fp16_kb']))
+        if not USE_Y_LL_ONLY:
+            for selected_option in [u_ll_options[0], v_ll_options[0]]:
+                if selected_option.get('param_size_fp16_kb') is not None:
+                    ll_param_sizes.append(float(selected_option['param_size_fp16_kb']))
+
+        bpp = calculate_bpp_from_param_sizes(ll_param_sizes, orig_h, orig_w)
         
         # Save results
         log_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_ll_only_log.json")
@@ -815,6 +867,7 @@ def main():
                 'u_psnr': float(u_psnr),
                 'v_psnr': float(v_psnr),
                 'rgb_psnr': float(rgb_psnr),
+                'bpp': None if bpp is None else float(bpp),
             },
         }
         
@@ -831,6 +884,8 @@ def main():
         print(f"  U PSNR: {u_psnr:.2f} dB")
         print(f"  V PSNR: {v_psnr:.2f} dB")
         print(f"  RGB PSNR: {rgb_psnr:.2f} dB")
+        if bpp is not None:
+            print(f"  BPP: {bpp:.4f} bits/pixel")
         return
 
     # ========================================================================
@@ -941,6 +996,12 @@ def main():
                 fp16_size = selected.get('param_size_fp16_kb')
                 if fp16_size is not None:
                     total_param_size_fp16_kb += float(fp16_size)
+
+        bpp = calculate_bpp_from_param_sizes(
+            collect_selected_param_sizes(selected_by_channel),
+            orig_h,
+            orig_w,
+        )
         
         # Save results
         log_path = os.path.join(OUTPUT_DIR, f"{IMAGEID}_custom_models_log.json")
@@ -955,6 +1016,7 @@ def main():
                 'u_psnr': float(u_psnr),
                 'v_psnr': float(v_psnr),
                 'rgb_psnr': float(rgb_psnr),
+                'bpp': None if bpp is None else float(bpp),
             },
             'total_checkpoint_file_size_kb': float(total_checkpoint_file_size_kb),
             'total_param_size_fp16_kb': float(total_param_size_fp16_kb),
@@ -976,6 +1038,8 @@ def main():
         print(f"  RGB PSNR: {rgb_psnr:.2f} dB")
         print(f"  Total file size: {total_checkpoint_file_size_kb:.1f} KB")
         print(f"  Total FP16 param size: {total_param_size_fp16_kb:.1f} KB")
+        if bpp is not None:
+            print(f"  BPP: {bpp:.4f} bits/pixel")
         return
 
     # ========================================================================
@@ -1107,6 +1171,7 @@ def main():
                 'u_psnr': float(u_psnr),
                 'v_psnr': float(v_psnr),
                 'rgb_psnr': float(rgb_psnr),
+                'bpp': None if calculate_bpp_from_param_sizes(collect_selected_param_sizes(selected_by_channel), orig_h, orig_w) is None else float(calculate_bpp_from_param_sizes(collect_selected_param_sizes(selected_by_channel), orig_h, orig_w)),
             },
             'total_checkpoint_file_size_kb': float(total_checkpoint_file_size_kb),
             'total_param_size_fp16_kb': float(total_param_size_fp16_kb),
@@ -1174,6 +1239,14 @@ def main():
         torch.FloatTensor(rgb_rec_best.flatten())
     )
 
+    best_per_band_bpp = calculate_bpp_from_param_sizes(
+        collect_param_sizes_from_option_map(selected_best_per_band['Y'])
+        + collect_param_sizes_from_option_map(selected_best_per_band['U'])
+        + collect_param_sizes_from_option_map(selected_best_per_band['V']),
+        orig_h,
+        orig_w,
+    )
+
     best_per_band_result = {
         'reconstruction_type': 'best_per_band',
         'metrics': {
@@ -1181,6 +1254,7 @@ def main():
             'u_psnr': float(u_psnr_best),
             'v_psnr': float(v_psnr_best),
             'rgb_psnr': float(rgb_psnr_best),
+            'bpp': None if best_per_band_bpp is None else float(best_per_band_bpp),
         },
         'selected_sub_bands': best_per_band_config,
     }
